@@ -14,52 +14,39 @@ Designed to be **fast, scalable, LAN-based, and easy to extend**.
 # 📁 System Architecture
 [Arduino] ⇆ [ESP Client] ⇆ [WebSocket Server] ⇆ [DB Client]
 
-
-### ✔ Arduino → Handles scanning, LCD, buttons, relay  
-### ✔ ESP → Sends/receives messages via WebSocket  
-### ✔ WebSocket Server → Pass-through message router  
-### ✔ DB Client → Brain of the system (database, decisions, logs)
+✔ Arduino → Handles RFID scanning, LCD, buttons, relay  
+✔ ESP → Sends/receives messages via WebSocket  
+✔ WebSocket Server → Pass-through message router  
+✔ DB Client → Brain of the system (database, decisions, logs)
 
 ---
 
 # 🧩 Components Overview
 
-## 🟦 1. Arduino (sketch.ino)
-### Responsibilities
+## 🟦 1. Arduino
 - Reads RFID tags using RC522 module  
-- UI via I2C LCD  
+- UI via I2C LCD 16x2  
 - Accepts button inputs (UP / OK / DOWN)  
 - Controls relay (door lock)  
-- Communicates with ESP over Serial  
-
-### Hardware Required
-- Arduino UNO / Nano / Mega  
-- I2C LCD (16x2 or 20x4)  
-- RC522 RFID Reader  
-- Relay Module  
-- Push Buttons  
-- ESP8266 or ESP32  
+- Communicates with ESP over Serial    
 
 ---
 
-## 🟩 2. ESP Client (esp_client.ino)
-### Responsibilities
+## 🟩 2. ESP Client
 - Connects to WiFi  
 - Maintains WebSocket connection  
 - Forwards messages between Arduino ↔ Python server  
 
 ---
 
-## 🟥 3. WebSocket Server (server.py)
-### Responsibilities
+## 🟥 3. WebSocket Server
 - Accepts multiple connections  
-- Forwards every message to all clients  
-- No logic — fully acts as a router  
+- Forwards messages between clients  
+- fully acts as a router  
 
 ---
 
-## 🟨 4. DB Client (db_client.py)
-### Responsibilities
+## 🟨 4. DB Client
 - User database management  
 - RFID card mapping  
 - Attendance logs  
@@ -70,50 +57,67 @@ This is the **brain** of the system.
 
 ---
 
+### Hardware Required
+| Component                               | Quantity |
+|-----------------------------------------|----------|
+| Arduino (Nano)                          | 1        |
+| ESP32                                   | 1        |
+| LCD 16x2                                | 1        |
+| IIC/I2C Serial Interface Adapter Module | 1        |
+| RC522 RFID Reader                       | 1        |
+| Relay Module                            | 1        |
+| Push Buttons                            | 3        |
+| Resistor 2.2k                           | 1        |
+| Resistor 1k                             | 1        |
+
 # 🔄 Message Flow
 
 ## 🧭 Arduino → DB Client
 Examples:
+- `LOG_ENTRY & EXIT`
 - `SEARCH_CARD`
+- `AUTH_ACCESS`
 - `ADD_USER`
-- `LOG_ENTRY`
-- `GET_USER`
-- `MARK_ATTENDANCE`
+- `DELETE_USER`
+- `SET_RESET_TIME`
 
 ## 🧭 DB Client → Arduino
 Examples:
+- `TIME_IN, OUT, DURATION & RESET`
 - `USER_FOUND`
+- `USER_NOT-FOUND`
 - `ACCESS_GRANTED`
 - `ACCESS_DENIED`
 - `USER_ADDED`
+- `USER_DELETED`
 - `ERROR`
 
 ---
 
 # 🧱 Recommended Folder Structure
-/rfid-attendance-system
-│
-├── arduino/
-│ └── sketch.ino
-│
-├── esp/
-│ └── esp_client.ino
-│
-├── server.py
-│
-├── db_client.py
-│
-├── userDatabase.xlsx
-├── userLogs.xlsx
-│
+/rfid-attendance-system<br>
+│<br>
+├── arduino/<br>
+│   └── sketch.ino<br>
+│<br>
+├── esp/<br>
+│   └── esp_client.ino<br>
+│<br>
+├── server.py<br>
+│<br>
+├── db_client.py<br>
+│<br>
+├── userDatabase.xlsx<br>
+├── userLogs.xlsx<br>
+│<br>
 └── README.md
 
 
 ---
 
-# 📚 Required Libraries (Exact + Correct GitHub Links)
+# 📚 Required Libraries
 
-Here are only the libraries that must be manually installed.
+Here are the libraries that must be manually installed.
 
 ---
 
@@ -152,7 +156,7 @@ pip install websockets
 
 
 ## For DB Client (`db_client.py`)
-pip install websockets openpyxl
+pip install openpyxl
 
 ---
 
@@ -168,13 +172,12 @@ pip install websockets openpyxl
 
 ## 🟩 2. ESP Client
 1. Install above libraries  
-2. Edit your WiFi and WebSocket IP:
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASS";
-const char* websocket_server = "YOUR_PC_IP"; 
-const uint16_t websocket_port = 8765;
-
-3. Upload to ESP32/ESP8266
+2. Edit your WiFi and WebSocket IP:<br>
+const char* ssid = "YOUR_WIFI";<br>
+const char* password = "YOUR_PASS";<br>
+const char* websocket_server_host= "YOUR_PC_IP";<br> 
+const uint16_t websocket_port = 8765;<br>
+3. Upload
 
 ## 🟥 3. Start WebSocket Server
 python server.py
@@ -184,7 +187,7 @@ python db_client.py
 
 
 # ▶️ Start Order (Important)
-1️⃣ Run server.py
-2️⃣ Run db_client.py
-3️⃣ Power/reset ESP
+1️⃣ Run server.py<br>
+2️⃣ Run db_client.py<br>
+3️⃣ Power/reset ESP<br>
 4️⃣ Power/reset Arduino
