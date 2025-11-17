@@ -99,11 +99,11 @@ Examples:
 │<br>
 ├── arduino/<br>
 │   └── sketch/<br>
-├───────└── sketch.ino/<br>
+│      └── sketch.ino/<br>
 │<br>
 ├── esp/<br>
 │   └── esp_client.ino<br>
-├───────└── esp_client.ino/<br>
+│      └── esp_client.ino/<br>
 │<br>
 ├── server.py<br>
 │<br>
