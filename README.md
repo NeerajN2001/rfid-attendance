@@ -95,25 +95,26 @@ Examples:
 ---
 
 # 🧱 Recommended Folder Structure
+<pre>
 /rfid-attendance-system<br>
-│<br>
-├── arduino/<br>
-│   └── sketch/<br>
-│      └── sketch.ino/<br>
-│<br>
-├── esp/<br>
-│   └── esp_client.ino<br>
-│      └── esp_client.ino/<br>
-│<br>
-├── server.py<br>
-│<br>
-├── db_client.py<br>
-│<br>
-├── userDatabase.xlsx<br>
-├── userLogs.xlsx<br>
-│<br>
-└── README.md
-
+  │<br>
+  ├── arduino/<br>
+  │    └── sketch/<br>
+  │        └── sketch.ino/<br>
+  │<br>
+  ├── esp/<br>
+  │    └── esp_client.ino<br>
+  │        └── esp_client.ino/<br>
+  │<br>
+  ├── server.py<br>
+  │<br>
+  ├── db_client.py<br>
+  │<br>
+  ├── userDatabase.xlsx<br>
+  ├── userLogs.xlsx<br>
+  │<br>
+  └── README.md
+</pre>
 
 ---
 
