@@ -96,23 +96,23 @@ Examples:
 
 # 🧱 Recommended Folder Structure
 <pre>
-/rfid-attendance-system<br>
-  │<br>
-  ├── arduino/<br>
-  │    └── sketch/<br>
-  │        └── sketch.ino/<br>
-  │<br>
-  ├── esp/<br>
-  │    └── esp_client.ino<br>
-  │        └── esp_client.ino/<br>
-  │<br>
-  ├── server.py<br>
-  │<br>
-  ├── db_client.py<br>
-  │<br>
-  ├── userDatabase.xlsx<br>
-  ├── userLogs.xlsx<br>
-  │<br>
+/rfid-attendance-system
+  │
+  ├── arduino/
+  │    └── sketch/
+  │        └── sketch.ino
+  │
+  ├── esp/
+  │    └── esp_client/
+  │        └── esp_client.ino
+  │
+  ├── server.py
+  │
+  ├── db_client.py
+  │
+  ├── userDatabase.xlsx
+  ├── userLogs.xlsx
+  │
   └── README.md
 </pre>
 
