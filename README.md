@@ -30,21 +30,15 @@ Designed to be **fast, scalable, LAN-based, and easy to extend**.
 - Controls relay (door lock)  
 - Communicates with ESP over Serial    
 
----
-
 ## 🟩 2. ESP Client
 - Connects to WiFi  
 - Maintains WebSocket connection  
 - Forwards messages between Arduino ↔ Python server  
 
----
-
 ## 🟥 3. WebSocket Server
 - Accepts multiple connections  
 - Forwards messages between clients  
 - fully acts as a router  
-
----
 
 ## 🟨 4. DB Client
 - User database management  
@@ -57,7 +51,7 @@ This is the **brain** of the system.
 
 ---
 
-### Hardware Required
+# 🧰 Hardware Required
 | Component                               | Quantity |
 |-----------------------------------------|----------|
 | Arduino (Nano)                          | 1        |
@@ -69,6 +63,8 @@ This is the **brain** of the system.
 | Push Buttons                            | 3        |
 | Resistor 2.2k                           | 1        |
 | Resistor 1k                             | 1        |
+
+---
 
 # 🔄 Message Flow
 
@@ -122,8 +118,6 @@ Examples:
 
 Here are the libraries that must be manually installed.
 
----
-
 ## 🟦 Arduino Libraries (sketch.ino)
 
 ### ✔ LiquidCrystal I2C  
@@ -135,8 +129,6 @@ Here are the libraries that must be manually installed.
 - **Author:** Miguel Balboa  
 - **GitHub:** https://github.com/miguelbalboa/rfid  
 - RC522 RFID reader driver
-
----
 
 ## 🟩 ESP32 / ESP8266 Libraries (esp_client.ino)
 
@@ -170,8 +162,6 @@ pip install openpyxl
 2. Open `sketch.ino`  
 3. Select board + port  
 4. Upload  
-
----
 
 ## 🟩 2. ESP Client
 1. Install above libraries  
