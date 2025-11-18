@@ -235,7 +235,7 @@ python db_client.py
 
 ---
 # 🔧 Pin Diagram
-<img width="1320" height="1080" alt="Circuit Diagram" src="https://github.com/user-attachments/assets/3701c687-e656-4959-801e-0e45c277e6bd" />
+<img width="1320" height="1080" alt="Circuit Diagram" src="https://github.com/user-attachments/assets/1cdb7647-19b7-4243-ac1e-131f271a2065" />
 
 ---
 # ▶️ Start Order (Important)
