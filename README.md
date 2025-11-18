@@ -3,7 +3,7 @@
 A fully modular **RFID-based Attendance & Access Control System** built using:
 
 - Arduino (UI + Hardware Control)
-- ESP8266/ESP32 (Networking)
+- ESP32 (Networking)
 - Python WebSocket Server (Message Router)
 - Python DB Client (Business Logic + Database Engine)
 
@@ -26,7 +26,8 @@ Designed to be **fast, scalable, LAN-based, and easy to extend**.
 ## 🟦 1. Arduino
 - Reads RFID tags using RC522 module  
 - UI via I2C LCD 16x2  
-- Accepts button inputs (UP / OK / DOWN)  
+- Accepts button inputs (UP / OK / DOWN)
+- Indicating LES's (WIFI, Power, Accept, Reject)  
 - Controls relay (door lock)  
 - Communicates with ESP over Serial    
 
@@ -55,14 +56,21 @@ This is the **brain** of the system.
 | Component                               | Quantity |
 |-----------------------------------------|----------|
 | Arduino (Nano)                          | 1        |
-| ESP32                                   | 1        |
+| RC522 RFID Reader                       | 1        |
 | LCD 16x2                                | 1        |
 | IIC/I2C Serial Interface Adapter Module | 1        |
-| RC522 RFID Reader                       | 1        |
-| Relay Module                            | 1        |
+| ESP32                                   | 1        |
 | Push Buttons                            | 3        |
+| Buzzer                                  | 1        |
+| Relay                                   | 1        |
+| LED - Green                             | 3        |
+| LED - RED                               | 1        |
+| Resistor 4.7k                           | 1        |
 | Resistor 2.2k                           | 1        |
 | Resistor 1k                             | 1        |
+| Resistor 220                            | 4        |
+| Diode IN4007                            | 1        |
+| Transistor BC547                        | 1        |
 
 ---
 
@@ -170,7 +178,7 @@ const char* ssid = "YOUR_WIFI";<br>
 const char* password = "YOUR_PASS";<br>
 const char* websocket_server_host= "YOUR_PC_IP";<br> 
 const uint16_t websocket_port = 8765;<br>
-3. Upload
+3. Upload (Remember you have to press Boot button on esp when uploading code)
 
 ## 🟥 3. Start WebSocket Server
 python server.py
