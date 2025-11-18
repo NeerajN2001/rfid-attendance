@@ -181,44 +181,63 @@ python db_client.py
 ---
 
 # 🔌 Pin Setup
-🟦 Buttons
-| Component | Pin |
-|----------|-----|
-| UP Button   | D6 |
-| OK Button   | D5 |
-| DOWN Button | D4 |
-
 🟥 RFID Module (RC522 / MFRC522)
-| RFID Pin | Arduino Pin |
-|----------|-------------|
-| SS (SDA) | D10         |
-| SCK      | D13         |
-| MOSI     | D11         |
-| MISO     | D12         |
-| RST      | D9          |
-| GND      | GND         |
-| 3.3V     | 3.3V        |
+| RFID Pin | Arduino Pin   |
+|----------|---------------|
+| SS (SDA) | D10           |
+| SCK      | D13           |
+| MOSI     | D11           |
+| MISO     | D12           |
+| RST      | D9            |
+| GND      | GND           |
+| 3.3V     | 3.3V          |
 | S01      | Not Connected |
 | RQ       | Not Connected |
 
+🟫 I2C Serial Interface Adapter
+| RFID Pin | Arduino Pin |
+|----------|-------------|
+| SCL      | A5          |
+| SDA      | A4          |
+| VCC      | 5V          |
+| GND      | GND         |
+
 🟩 ESP (ESP32 / ESP8266 Serial Bridge)
-| ESP Pin | Arduino Pin |
-|---------|-------------|
-| RX (GPIO 16) | TX (D1) |
-| TX (GPIO 17) | RX (D0) |
+| ESP Pin      | Arduino Pin |
+|--------------|-------------|
+| RX (GPIO 16) | TX (D1)     |
+| TX (GPIO 17) | RX (D0)     |
+
+🟦 Buttons
+| Component   | Pin |
+|-------------|-----|
+| UP Button   | D4  |
+| OK Button   | D3  |
+| DOWN Button | D2  |
+
+🟧 Indicating LED's
+| Component   | Pin |
+|-------------|-----|
+| Accept      | D7  |
+| Reject      | D6  |
+| WIFI        | D5  |
+| Green Power | 5V  |
 
 🟪 Relay
 | Component | Pin |
-|----------|-----|
-| Relay IN | D7 |
+|---------- |-----|
+| Relay IN  | D7  |
 
 🟨 Buzzer
 | Component | Pin |
-|----------|-----|
-| Buzzer | D8 |
+|-----------|-----|
+| Buzzer    | D8  |
 
 ---
+# 🔧 Pin Diagram
+<img width="1320" height="1080" alt="Circuit Diagram" src="https://github.com/user-attachments/assets/3701c687-e656-4959-801e-0e45c277e6bd" />
 
+---
 # ▶️ Start Order (Important)
 1️⃣ Run server.py<br>
 2️⃣ Run db_client.py<br>
