@@ -188,6 +188,46 @@ python server.py
 ## 🟨 4. Start DB Client
 python db_client.py
 
+---
+
+# 🔌 Pin Setup
+🟦 Buttons
+| Component | Pin |
+|----------|-----|
+| UP Button   | D6 |
+| OK Button   | D5 |
+| DOWN Button | D4 |
+
+🟥 RFID Module (RC522 / MFRC522)
+| RFID Pin | Arduino Pin |
+|----------|-------------|
+| SS (SDA) | D10         |
+| SCK      | D13         |
+| MOSI     | D11         |
+| MISO     | D12         |
+| RST      | D9          |
+| GND      | GND         |
+| 3.3V     | 3.3V        |
+| S01      | Not Connected |
+| RQ       | Not Connected |
+
+🟩 ESP (ESP32 / ESP8266 Serial Bridge)
+| ESP Pin | Arduino Pin |
+|---------|-------------|
+| RX (GPIO 16) | TX (D1) |
+| TX (GPIO 17) | RX (D0) |
+
+🟪 Relay
+| Component | Pin |
+|----------|-----|
+| Relay IN | D7 |
+
+🟨 Buzzer
+| Component | Pin |
+|----------|-----|
+| Buzzer | D8 |
+
+---
 
 # ▶️ Start Order (Important)
 1️⃣ Run server.py<br>
