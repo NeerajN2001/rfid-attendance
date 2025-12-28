@@ -1,189 +1,356 @@
+/*
+ * ==================================================================================
+ * PROJECT: ESP32 WiFi & WebSocket Bridge for RFID Attendance
+ * HARDWARE: ESP32 (acting as a Serial-to-WebSocket Gateway)
+ * * DESCRIPTION:
+ * This firmware allows an Arduino to communicate with a remote Python server.
+ * 1. It listens for JSON commands from Arduino via Serial (9600 baud).
+ * 2. It manages local WiFi connections using non-volatile storage (Preferences).
+ * 3. It routes packets to a central Database Client via WebSockets.
+ * 4. It emulates an "open-drain" status line to signal the Arduino when online.
+ * ==================================================================================
+ */
+
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 
-// --- WiFi Settings ---
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASS";
+// ----------------------------------------------------------------------------------
+// --- NETWORK & SERVER CONFIGURATION ---
+// ----------------------------------------------------------------------------------
 
-// --- Server Settings ---
-const char* websocket_server_host = "YOUR_PC_IP"; // REPLACE with the IP of your Python server (e.g., your laptop's IP)
-const uint16_t websocket_server_port = 8765;
-const char* client_name = "esp_client"; // Consistent client name
-const char* target_name = "db_client"; // Target is the Python client 'db_client'
+const char* websocket_server_host = "192.168.31.164"; // Target Python server IP
+const uint16_t websocket_server_port = 8765;          // Target WebSocket port
+const char* client_name = "esp_client";               // Identity of this ESP32
+const char* target_name = "db_client";                // Target identity for data routing
+
+// ----------------------------------------------------------------------------------
+// --- HARDWARE & STORAGE DEFINITIONS ---
+// ----------------------------------------------------------------------------------
+/* GPIO23 is used to signal WiFi status to the Arduino.
+ * We use "Open-Drain" emulation:
+ * - Not Connected: Pin is INPUT (High Impedance), Arduino pulls it HIGH via pull-up.
+ * - Connected: Pin is OUTPUT LOW, pulling the Arduino line LOW.
+ */
+const int WIFI_STATUS_GPIO = 23; // GPIO23 -> Arduino WIFI_STATUS_PIN (A2)
+
+// NVS (Non-Volatile Storage) Keys
+const char* PREF_SSID_KEY = "wifi_ssid";
+const char* PREF_PASS_KEY = "wifi_pass";
+const char* PREF_NAMESPACE = "rfid_att";
+
+// Runtime variables
+String storedSSID = "";
+String storedPASS = "";
+int prevWiFiStatus = WL_DISCONNECTED;
 
 WebSocketsClient webSocket;
+Preferences preferences;
 
-// --- Serial Communication Configuration ---
-// Serial (Default 115200) is used for debug output to the computer.
-// Serial2 is used for Arduino communication (9600 baud)
-#define ARDUINO_RX_PIN 16 // ESP32 pin connected to Arduino TX
-#define ARDUINO_TX_PIN 17 // ESP32 pin connected to Arduino RX
-// -----------------------------------------
-
-// Buffer to store incoming JSON command from Arduino
+// Serial Communication State
 String arduinoCommandBuffer = "";
 bool newCommandReceived = false;
 
-// Function to send a WebSocket message
-void sendWebSocketMessage(const char* jsonPayload) {
-    if (webSocket.isConnected()) {
-        webSocket.sendTXT(jsonPayload);
-        Serial.printf("[WS] SENT: %s\n", jsonPayload);
-    } else {
-        Serial.println("[WS] ERROR: Cannot send, WebSocket disconnected.");
-    }
+// ----------------------------------------------------------------------------------
+// --- GPIO STATUS HELPERS (OPEN-DRAIN EMULATION) ---
+// ----------------------------------------------------------------------------------
+
+/* Signals "Connected" to the Arduino.
+ * We set the pin to OUTPUT and drive it LOW. 
+ */
+void setStatusConnected() {
+  pinMode(WIFI_STATUS_GPIO, OUTPUT);
+  digitalWrite(WIFI_STATUS_GPIO, LOW);
 }
 
-// Function to handle WebSocket events
+/* Signals "Disconnected" to the Arduino.
+ * We set the pin to INPUT (High Impedance). 
+ * The Arduino's internal pull-up will then pull the line to 5V/3.3V (HIGH).
+ */
+void setStatusNotConnected() {
+  pinMode(WIFI_STATUS_GPIO, INPUT); // high-impedance -> Arduino pull-up reads HIGH
+}
+
+// ----------------------------------------------------------------------------------
+// --- WIFI & CREDENTIAL MANAGEMENT ---
+// ----------------------------------------------------------------------------------
+
+/* Persists WiFi credentials to the ESP32's internal flash memory.
+ */
+void saveCredentials(const String& newSsid, const String& newPass) {
+  preferences.begin(PREF_NAMESPACE, false);
+  preferences.putString(PREF_SSID_KEY, newSsid);
+  preferences.putString(PREF_PASS_KEY, newPass);
+  preferences.end();
+
+  storedSSID = newSsid;
+  storedPASS = newPass;
+}
+
+/* Loads saved credentials from flash. 
+ * Defaults to "wifi"/"12345678" if memory is empty.
+ */
+void loadCredentials() {
+  preferences.begin(PREF_NAMESPACE, true); // read-only
+  storedSSID = preferences.getString(PREF_SSID_KEY, "");
+  storedPASS = preferences.getString(PREF_PASS_KEY, "");
+  preferences.end();
+
+  if (storedSSID == "") {
+    storedSSID = "wifi";
+    storedPASS = "12345678";
+  }
+}
+
+/* Performs a local WiFi scan and returns results to the Arduino in JSON format.
+*/
+void handleScanWifi() {
+  while (Serial.available()) Serial.read();
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  int n = WiFi.scanNetworks(false, false);
+  String nets = "";
+  int added = 0;
+
+  // Compile up to 6 SSIDs into a semicolon-separated string
+  for (int i = 0; i < n && added < 6; i++) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+    if (ssid.length() > 16) ssid = ssid.substring(0, 16); // Truncate for LCD display
+
+    if (nets.length() > 0) nets += ";";
+    nets += ssid;
+    added++;
+  }
+
+  // Format the response for the Arduino
+  StaticJsonDocument<128> doc;
+  doc["md"] = "scan_wifi";
+  doc["nets"] = nets;
+
+  String out;
+  serializeJson(doc, out);
+  Serial.println(out);  // Send back to Arduino
+
+  WiFi.scanDelete();    // Free memory
+}
+
+/* Attempt to connect to WiFi. Blocking for up to 10 seconds.
+ */
+bool connectToWiFi() {
+  if (storedSSID.length() == 0) return false;
+
+  WiFi.disconnect(true);
+  WiFi.begin(storedSSID.c_str(), storedPASS.c_str());
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startTime < 10000)) {
+    delay(500);
+  }
+  
+  return (WiFi.status() == WL_CONNECTED);
+}
+
+// ----------------------------------------------------------------------------------
+// --- WEBSOCKET EVENT HANDLING ---
+// ----------------------------------------------------------------------------------
+
+/* Core WebSocket logic: Handles connection, registration, and data routing.
+ */
+void sendWebSocketMessage(const char* jsonPayload) {
+  if (webSocket.isConnected()) {
+    webSocket.sendTXT(jsonPayload);
+  }
+}
+
 void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-  switch(type) {
+  switch (type) {
     case WStype_DISCONNECTED:
-      Serial.printf("[WS] DISCONNECTED: %s\n", client_name);
+      setStatusNotConnected();     // Drop line to inform Arduino
       break;
+    
     case WStype_CONNECTED: {
-      Serial.printf("[WS] CONNECTED: to %s\n", payload);
+      setStatusConnected();        // Pull line LOW to inform Arduino
       
-      // 1. Send registration message upon successful connection
+      // Immediately register this client with the WebSocket server
       StaticJsonDocument<256> reg_doc;
       reg_doc["type"] = "register";
       reg_doc["name"] = client_name;
-      
       String output;
       serializeJson(reg_doc, output);
       webSocket.sendTXT(output);
-      Serial.printf("[WS] Sent registration: %s\n", output.c_str());
       break;
     }
-    case WStype_TEXT: { 
-      // Parse the incoming JSON message to check sender/type
+    
+    case WStype_TEXT: {
+      // Message received from Server
       StaticJsonDocument<512> in_doc;
-      DeserializationError error = deserializeJson(in_doc, payload);
-
-      if (error) {
-        Serial.printf("[WS] ERROR: JSON deserialization failed: %s\n", error.f_str());
-        return;
-      }
+      DeserializationError err = deserializeJson(in_doc, payload, length);
       
-      // Check if this is a forwarded message from db_client
-      if (in_doc["from"] == target_name) {
-        
-        // --- PASS: Forward ONLY the inner 'msg' JSON back to Arduino ---
-        String replyJson;
-        // Extracts the inner message (e.g., {"md":"scan", "nm":"User Name", ...})
-        serializeJson(in_doc["msg"], replyJson);
-        
-        // Send JSON string + newline terminator to Arduino
-        Serial2.print(replyJson);
-        Serial2.print('\n'); 
-        
-        // Debug output: Confirms the raw JSON was successfully forwarded to Arduino
-        Serial.printf("[ARDUINO] ⬅️ Sent Reply JSON: %s\n", replyJson.c_str());
-      }
+      if (err) return;
       
-      // Other messages (e.g., server status or error)
-      else if (in_doc.containsKey("status") || in_doc.containsKey("error")) {
-        Serial.printf("[SERVER] STATUS: %s\n", in_doc["message"].as<const char*>() ? in_doc["message"].as<const char*>() : in_doc["error"].as<const char*>());
+      // Filter: Check if the message is specifically from the Database client
+      if (in_doc.containsKey("from") && String((const char*)in_doc["from"].as<const char*>()) == String(target_name)) {
+        if (in_doc.containsKey("msg")) {
+          // Extract the actual command/response and forward it to the Arduino via Serial
+          String replyJson;
+          serializeJson(in_doc["msg"], replyJson);
+          Serial.print(replyJson);
+          Serial.print('\n');        // Terminate with newline for Arduino's parser
+        }
       }
-      
       break;
-    } 
+    }
+    
     case WStype_BIN:
-      // Removed unnecessary debug prints for binary data, ping, pong, and fragments
-      break;
     case WStype_PING:
     case WStype_PONG:
-      break;
     case WStype_ERROR:
-      Serial.println("[WS] ERROR: Protocol error occurred.");
-      break;
     case WStype_FRAGMENT_TEXT_START:
     case WStype_FRAGMENT_BIN_START:
     case WStype_FRAGMENT:
     case WStype_FRAGMENT_FIN:
-      break;
+    break;
   }
 }
 
-// Function to process incoming serial data from Arduino
-void readArduinoSerial() {
-    while (Serial2.available()) {
-        char incomingChar = Serial2.read();
+// ----------------------------------------------------------------------------------
+// --- SERIAL COMMAND PROCESSING ---
+// ----------------------------------------------------------------------------------
 
-        // Assuming Arduino sends the full JSON command followed by a newline character
-        if (incomingChar == '\n') {
-            // Newline received, command is complete
-            newCommandReceived = true;
-            // Debug print: Shows the raw command received from Arduino
-            Serial.printf("[ARDUINO] ➡️ Received CMD: %s\n", arduinoCommandBuffer.c_str());
-        } else {
-             // Append character to buffer
-            arduinoCommandBuffer += incomingChar;
-        }
+/* Reads incoming characters from the Arduino until a newline is found.
+ */
+void readArduinoSerial() {
+  while (Serial.available()) {
+    char incomingChar = Serial.read();
+    if (incomingChar == '\n') {
+      newCommandReceived = true;
+      return;
     }
+    else {
+      arduinoCommandBuffer += incomingChar;
+    }
+  }
 }
+
+/* Parses JSON from Arduino and decides if it's a local command or needs forwarding.
+ */
+void processArduinoCommand() {
+  if (!newCommandReceived) return;
+
+  String cleaned = arduinoCommandBuffer;
+  cleaned.trim();
+  arduinoCommandBuffer = "";
+  newCommandReceived = false;
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, cleaned);
+
+  if (err) return;
+
+  const char* md = doc["md"].as<const char*>();
+
+  // CASE 1: Request to update local WiFi settings
+  if (md != nullptr && strcmp(md, "wifi") == 0) {
+    const char* newSsid = doc["SSID"].as<const char*>();
+    const char* newPass = doc["PASS"].as<const char*>();
+    
+    StaticJsonDocument<128> reply_doc;
+    reply_doc["md"] = "wifi";
+
+    if (newSsid != nullptr && strlen(newSsid) > 0) {
+      saveCredentials(newSsid, newPass != nullptr ? newPass : "");
+      
+      if (connectToWiFi()) {
+        reply_doc["rslt"] = "C"; // Connected
+      }
+      else {
+        // Note: ESP32 doesn't easily distinguish between "not found" and "wrong password"
+        // For simplicity based on prompt, we reply "NC" for failed attempts.
+        reply_doc["rslt"] = "NC"; // Not connected
+      }
+    }
+    else {
+      // Should not happen if Arduino side is working, but safety check
+      reply_doc["rslt"] = "ERR";
+    }
+    
+    String replyJson;
+    serializeJson(reply_doc, replyJson);
+    Serial.print(replyJson);
+    Serial.print('\n');
+    return;
+  }
+
+    // CASE 2: Request to scan for nearby networks
+    if (md != nullptr && strcmp(md, "scan_wifi") == 0) {
+      handleScanWifi();
+      return;
+    }
+
+  // CASE 3: Standard Data Request (forwarded to the server)
+  else {
+    if (webSocket.isConnected()) {
+      // Build routing document
+      StaticJsonDocument<512> routing_doc;
+      routing_doc["to"] = target_name;
+
+      // Copy original received JSON object into routing_doc["msg"]
+      routing_doc["msg"] = doc.as<JsonObject>(); 
+      
+      String ws_output;
+      serializeJson(routing_doc, ws_output);
+      sendWebSocketMessage(ws_output.c_str());
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------------
+// --- MAIN EXECUTION BLOCKS ---
+// ----------------------------------------------------------------------------------
 
 void setup() {
-  // Debug Serial (USB)
-  Serial.begin(115200); 
+  Serial.begin(9600);
   delay(10);
-  Serial.println("\n--- ESP32 DEBUG SERIAL READY ---");
+  
+  loadCredentials();           // Retrieve SSID/Pass from Flash
+  setStatusNotConnected();     // Default state: Offline
+  connectToWiFi();             // Attempt connection
 
-  // Arduino Serial (RX/TX pins)
-  Serial2.begin(9600, SERIAL_8N1, ARDUINO_RX_PIN, ARDUINO_TX_PIN);
-  Serial.printf("Arduino Serial (Serial2) initialized at 9600 baud (RX:%d, TX:%d).\n", ARDUINO_RX_PIN, ARDUINO_TX_PIN);
-  
-  // --- Connect to WiFi ---
-  Serial.printf("\nConnecting to %s", ssid);
-  WiFi.begin(ssid, password);
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  // Sync Hardware Pin with current connection status
+  prevWiFiStatus = WiFi.status();
+  if (prevWiFiStatus == WL_CONNECTED) setStatusConnected();
+  else setStatusNotConnected();
+  if (WiFi.status() == WL_CONNECTED) {
+    webSocket.begin(websocket_server_host, websocket_server_port, "/");
+    webSocket.onEvent(webSocketEvent);
+    webSocket.setReconnectInterval(5000);
   }
-  Serial.println("\nWiFi connected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  // --- WebSocket Initialization ---
-  webSocket.begin(websocket_server_host, websocket_server_port, "/");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
 }
 
 void loop() {
+  // Keep WebSocket heartbeats and events running
   webSocket.loop();
-  readArduinoSerial(); // Check for incoming commands from Arduino
 
-  // If a full command was received from Arduino, process and send it to db_client
-  if (newCommandReceived) {
-    if (webSocket.isConnected()) {
-        
-        StaticJsonDocument<512> routing_doc;
-        routing_doc["to"] = target_name;
-        
-        String cleaned_command = arduinoCommandBuffer;
-        cleaned_command.trim(); 
-        
-        // Deserialize the Arduino command string into the 'msg' object
-        // This is the "get" and "wrap" part.
-        DeserializationError error = deserializeJson(routing_doc["msg"], cleaned_command);
+  // Check for incoming data from Arduino
+  readArduinoSerial();
+  processArduinoCommand();
 
-        if (error) {
-            Serial.printf("[ARDUINO] ERROR: Failed to parse JSON from Arduino: %s. Command: %s\n", error.f_str(), cleaned_command.c_str());
-        } else {
-            // Send the fully routed message over WebSocket
-            // This is the "sent" part.
-            String ws_output;
-            serializeJson(routing_doc, ws_output);
-            sendWebSocketMessage(ws_output.c_str());
-        }
-    } else {
-        Serial.println("[WS] WARNING: WebSocket not connected. Cannot send Arduino command.");
+  // Watchdog for WiFi status changes
+  int cur = WiFi.status();
+  if (cur != prevWiFiStatus) {
+    if (cur == WL_CONNECTED) {
+      setStatusConnected();
+      // When connection is re-established, try to start WebSocket
+      webSocket.begin(websocket_server_host, websocket_server_port, "/");
+      webSocket.onEvent(webSocketEvent);
+      webSocket.setReconnectInterval(5000);
     }
-    
-    // Reset the buffer and flag for the next command
-    arduinoCommandBuffer = "";
-    newCommandReceived = false;
+    else {
+      setStatusNotConnected();
+    }
+    prevWiFiStatus = cur;
   }
 }
