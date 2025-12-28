@@ -1,80 +1,123 @@
-// Required library for 16x2 LCD with I2C adapter
-#include <LiquidCrystal_I2C.h>
-// Required libraries for RFID (MFRC522)
-#include <SPI.h>
-#include <MFRC522.h>
-#include <avr/pgmspace.h> // Required for F() macro and PROGMEM string functions
+/*
+ * ==================================================================================
+ * PROJECT: RFID Attendance System with Serial-JSON Integration
+ * HARDWARE: Arduino Uno/Nano, MFRC522 RFID, 16x2 I2C LCD, Buzzer, LEDs, Reed Switch
+ * * DESCRIPTION:
+ * This system manages user attendance via RFID tags. It communicates with a host 
+ * system using JSON over Serial for data persistence (Add, Delete, Scan, WiFi).
+ * It features a multi-level menu system, non-blocking indicator updates, and 
+ * an automated door lock mechanism controlled by a Reed switch sensor.
+ * ==================================================================================
+ */
 
-// --- LCD Configuration ---
-// Check your I2C address; common ones are 0x27 or 0x3F.
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
+#include <LiquidCrystal_I2C.h>  // Library for I2C LCD control
+#include <SPI.h>                // SPI communication for the RFID module
+#include <MFRC522.h>            // Library for MFRC522 RFID reader
+#include <avr/pgmspace.h>       // Enables storing constant strings in Flash (SRAM saving)
 
-// --- Button Pin Definitions ---
-#define UP_PIN 6
-#define SELECT_PIN 5
-#define DOWN_PIN 4
+// ----------------------------------------------------------------------------------
+// --- HARDWARE CONFIGURATION & PIN DEFINITIONS ---
+// ----------------------------------------------------------------------------------
 
-// --- RFID Configuration (Common default pins) ---
-#define RST_PIN 9 	// Configurable reset pin 
-#define SS_PIN 10 	// SPI Slave Select (SS) pin
-MFRC522 mfrc522(SS_PIN, RST_PIN); // Create MFRC522 instance
+// LCD setup: 0x27 is the standard I2C address for most 1602 modules
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// Debounce and Timing constants
-const int DEBOUNCE_DELAY = 50; // Milliseconds to wait for a stable input
-const unsigned long LONG_PRESS_DURATION = 2000; // 2 seconds for 'RETURN' or 'EXIT'
-const unsigned long MENU_ENTRY_DURATION = 5000; // 5 seconds for menu entry trigger (now triggers AUTH)
-const unsigned long POST_ENTRY_DELAY = 2000; // 2000ms delay after entry to ignore button releases
-const unsigned long SERIAL_TIMEOUT = 5000; // 5 seconds to wait for a host reply
-const unsigned long SCAN_DISPLAY_TIME = 3000; // 3 seconds to show transaction results
+// Output Indicator Pins
+#define BUZZER_PIN A1
+#define ACCEPT_PIN 4    // Connects to Green LED and Door Lock Relay/Transistor
+#define REJECT_PIN 9    // Connects to Red LED
+#define WIFI_LED 8      // Connects to Green/WiFi Status LED
 
-// --- Menu Configuration (Moved to Flash using PROGMEM) ---
-// Main Menu
+// Status Input Pins
+#define WIFI_STATUS_PIN A2  // Pulled LOW by external host (ESP8266/ESP32) when WiFi is active
+
+// Navigation Button Pins (Using Internal Pullups)
+#define UP_PIN 7
+#define SELECT_PIN 6
+#define DOWN_PIN 5
+#define REED_PIN A3   // Magnetic Reed Switch: Detects if the door is physically open/closed
+
+// RFID MFRC522 Pins
+#define RST_PIN A0                    // Reset pin for RFID module
+#define SS_PIN 10                     // Slave Select (SS) pin for SPI communication
+MFRC522 mfrc522(SS_PIN, RST_PIN);     // Initialize MFRC522 instance
+
+// ----------------------------------------------------------------------------------
+// --- SYSTEM CONSTANTS & TIMING ---
+// ----------------------------------------------------------------------------------
+
+const int DEBOUNCE_DELAY = 50;                    // Stability window for button reads (ms)
+const unsigned long LONG_PRESS_DURATION = 2000;   // Time held for 'Back' or 'Exit' actions
+const unsigned long MENU_ENTRY_DURATION = 5000;   // Time held to trigger the Auth/Admin menu
+const unsigned long POST_ENTRY_DELAY = 2000;      // Cooldown after entering menu to prevent accidental clicks
+const unsigned long SERIAL_TIMEOUT = 5000;        // Max wait time for a JSON response from host
+const unsigned long SCAN_DISPLAY_TIME = 3000;     // Duration transaction results stay on screen
+
+// ----------------------------------------------------------------------------------
+// --- MENU STRUCTURE (Stored in PROGMEM to save SRAM) ---
+// ----------------------------------------------------------------------------------
+
+// Main Menu Strings
 const char menu1[] PROGMEM = "1. Add User";
 const char menu2[] PROGMEM = "2. Delete User";
 const char menu3[] PROGMEM = "3. Settings";
-
-const char* const menuItems[] PROGMEM = {
-  menu1,
-  menu2,
-  menu3,
-};
+const char* const menuItems[] PROGMEM = {menu1, menu2, menu3,};
 const int MENU_SIZE = sizeof(menuItems) / sizeof(menuItems[0]);
 
-// Settings Sub-Menu (Kept in RAM for easier access/padding, since they are few)
-const char* const settingsMenuItems[] = {
-    "1. Set Timer",
-    "2. Check Conn",
-};
+// Settings Sub-Menu Strings (Padded for visual alignment on LCD)
+const char setting1[] PROGMEM = "1. Set Timer";
+const char setting2[] PROGMEM = "2. WiFi     ";
+const char* const settingsMenuItems[] PROGMEM = {setting1, setting2,};
 const int SETTINGS_MENU_SIZE = sizeof(settingsMenuItems) / sizeof(settingsMenuItems[0]);
 
+// ----------------------------------------------------------------------------------
+// --- GLOBAL STATE VARIABLES ---
+// ----------------------------------------------------------------------------------
 
-// --- Menu State Variables ---
-int currentSelection = 0; // Tracks which item is highlighted (0 to MENU_SIZE - 1)
-int menuState = -2; 	// -3: Authentication Mode, -2: Scan/Idle Mode, 0: Main Menu, 1-N: Action State
+// State Management
+int currentSelection = 0;     // Currently highlighted menu index
+int menuState = -2;           // -3: Auth Scan, -2: Main Idle, 0: Menu, 1+: Sub-processes
 
 // --- Debounce/Timing State Variables ---
 unsigned long lastDebounceTime = 0;
 unsigned long selectPressStart = 0; 
-unsigned long entryPressStart = 0; 	
-unsigned long menuEntryTime = 0; 	
+unsigned long entryPressStart = 0;
+unsigned long menuEntryTime = 0; 
 bool isLongPressReturnActive = false; 
-
-// We track the last *stable* state for each button
 int lastUpState = HIGH;
 int lastDownState = HIGH;
 int lastSelectState = HIGH;
 
-// --- JSON Buffer Size (Optimized for safe margin) ---
-const int MAX_REPLY_BUFFER_SIZE = 64; 
-const int MAX_SCAN_BUFFER_SIZE = 128; // Larger for transaction replies
-const int MAX_NAME_SIZE = 32; // Increased size for user name
+// Shared Buffer Management (Optimized for ATmega328P memory constraints)
+const int MAX_GLOBAL_BUFFER_SIZE = 128; 
+char g_serial_buffer[MAX_GLOBAL_BUFFER_SIZE];     // Shared buffer for incoming Serial JSON
+int g_serial_index = 0;
+const int MAX_EXTRACT_BUFFER = 64;
+char g_temp_extract_buffer[MAX_EXTRACT_BUFFER];   // Shared buffer for JSON key-value extraction
+const int MAX_NAME_SIZE = 32;
 
-// --- GLOBAL FLAGS FOR VISUAL SYNCHRONIZATION ---
-// FIX: Flag for mainCardScan display status is now global for cross-function reset.
+// Door/Security Logic
+bool doorForceUnlock = false;
+bool doorOpened = false;
+unsigned long doorLockTimer = 0;
+
+// Indicators & WiFi
+bool wifiConnected = false;
+bool requestDirectWifiEntry = false;
+char wifiChosenSSID[28] = {0};
+char wifiChosenPass[28] = {0};
 bool mainScanDisplayDrawn = false;
+unsigned long buzzerEndTime = 0;
+unsigned long acceptLedEndTime = 0;
+unsigned long rejectLedEndTime = 0;
+unsigned long doubleBeepTimer = 0;
+bool doubleBeepStage = false;
+bool doubleBeepActive = false;
 
+// ----------------------------------------------------------------------------------
+// --- Function Prototypes ---
+// ----------------------------------------------------------------------------------
 
-// --- Function Prototypes (Updated handleAuthentication) ---
 void displayMenu(); 
 void handleInput();
 void handleAuthentication();
@@ -84,28 +127,113 @@ void deleteUser();
 void settings();
 void printUIDHex();
 char* extractValue(const char* buffer, const char* key, char* result, int resultSize);
+void sendSerialJson(const __FlashStringHelper* md, const char* id, const char* un, const char* ut, const __FlashStringHelper* opt, const char* tm);
+void sendWifiJson(const char* ssid, const char* pass);
 
+// ----------------------------------------------------------------------------------
+// --- INDICATOR & DOOR LOGIC (NON-BLOCKING) ---
+// ----------------------------------------------------------------------------------
 
-// --- Helper Function for LCD Printing ---
-// 1. Both lines are Flash strings (F())
-void printScreen(const __FlashStringHelper* line1, const __FlashStringHelper* line2) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(line1);
-  lcd.setCursor(0, 1);
-  lcd.print(line2);
+// Triggers a single short beep and pulse.
+void beepOnce() {tone(BUZZER_PIN, 2000, 150);}
+
+// Triggers two short beeps using a state-based timer to avoid blocking loop().
+void beepTwice() {
+  tone(BUZZER_PIN, 2000, 150);
+  doubleBeepTimer = millis() + 250;
+  doubleBeepStage = false;
+  doubleBeepActive = true;
 }
 
-// 2. Both lines are RAM strings (char*)
-void printScreen(const char* line1, const char* line2) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(line1);
-  lcd.setCursor(0, 1);
-  lcd.print(line2);
+// Activates the unlock relay (ACCEPT_PIN) and starts the smart door auto-lock sequence.
+void pulseAccept() {
+  digitalWrite(ACCEPT_PIN, HIGH);
+  doorForceUnlock = true;
+  doorOpened = false;
+  doorLockTimer = 0;
 }
 
-// 3. Line 1 is Flash, Line 2 is RAM (FIX for Search/Title screens)
+// Pulses the Reject indicator for 1 second.
+void pulseReject() {
+  digitalWrite(REJECT_PIN, HIGH);
+  rejectLedEndTime = millis() + 1000;
+}
+
+/*
+Updates LED and Buzzer states based on timers. 
+Called continuously in main loop().
+*/
+void indicatorUpdate() {
+  unsigned long now = millis();
+  
+  if (doubleBeepActive) {
+    if (!doubleBeepStage && now >= doubleBeepTimer) {
+      tone(BUZZER_PIN, 2000, 150);  // second beep
+      doubleBeepStage = true;
+      doubleBeepTimer = now + 150;  // wait until second beep ends
+    }
+    else if (doubleBeepStage && now >= doubleBeepTimer) {
+      doubleBeepActive = false;
+    }
+  }
+  
+  if (now > rejectLedEndTime) {
+    digitalWrite(REJECT_PIN, LOW);
+  }
+  
+  // WiFi Indicator: Solid if connected, Blinking if searching
+  static unsigned long wifiTimer = 0;
+  static bool wifiBlink = false;
+  
+  int s = digitalRead(WIFI_STATUS_PIN);
+  wifiConnected = (s == LOW);
+  
+  if (wifiConnected) {
+    digitalWrite(WIFI_LED, HIGH);
+    wifiTimer = millis();
+    wifiBlink = true;
+  }
+  else {
+    if (millis() - wifiTimer > 1000) {
+      wifiTimer = millis();
+      wifiBlink = !wifiBlink;
+    }
+    digitalWrite(WIFI_LED, wifiBlink ? HIGH : LOW);
+  }
+}
+
+/* Door Lock Logic:
+ * 1. Door is unlocked by system.
+ * 2. System waits for Reed Switch to detect door opening.
+ * 3. Once opened, system waits for Reed Switch to detect door closing.
+ * 4. Once closed, locks the door after a 3-second delay.
+ */
+void doorUpdate() {
+  int reedState = digitalRead(REED_PIN); // HIGH = closed, LOW = open
+  unsigned long now = millis();
+  
+  if (doorForceUnlock) {
+    if (!doorOpened && reedState == LOW) {
+      doorOpened = true;
+    }
+    if (doorOpened && reedState == HIGH) {
+      if (doorLockTimer == 0) {
+        doorLockTimer = now + 3000;
+      }
+    }
+    if (doorLockTimer > 0 && now >= doorLockTimer) {
+      digitalWrite(ACCEPT_PIN, LOW);  // LOCK DOOR
+      doorForceUnlock = false;
+      doorOpened = false;
+      doorLockTimer = 0;
+    }
+  }
+}
+
+// ----------------------------------------------------------------------------------
+// --- LCD & SERIAL ---
+// ----------------------------------------------------------------------------------
+
 void printScreen(const __FlashStringHelper* line1, const char* line2) {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -113,8 +241,20 @@ void printScreen(const __FlashStringHelper* line1, const char* line2) {
   lcd.setCursor(0, 1);
   lcd.print(line2);
 }
-
-// 4. Line 1 is RAM, Line 2 is Flash (FIX for Settings confirmation screen)
+void printScreen(const char* line1, const char* line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
+void printScreen(const __FlashStringHelper* line1, const __FlashStringHelper* line2) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
+}
 void printScreen(const char* line1, const __FlashStringHelper* line2) {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -123,76 +263,70 @@ void printScreen(const char* line1, const __FlashStringHelper* line2) {
   lcd.print(line2);
 }
 
-
-// Helper to convert UID to Hex string
+// Helper to convert UID to Hex string (prints to Serial - unchanged)
 void printUIDHex() {
-    for (byte i = 0; i < mfrc522.uid.size; i++) {
-        if (mfrc522.uid.uidByte[i] < 0x10) {
-            Serial.print(F("0"));
-        }
-        Serial.print(mfrc522.uid.uidByte[i], HEX); 
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) {
+      Serial.print(F("0"));
     }
+    Serial.print(mfrc522.uid.uidByte[i], HEX); 
+  }
 }
 
-// --- Helper Function for Centralized JSON Output (Optimized) ---
+// Constructs and sends a standardized JSON packet to the Serial port.
 void sendSerialJson(const __FlashStringHelper* md, const char* id, const char* un, const char* ut, const __FlashStringHelper* opt, const char* tm) {
-  // Start the JSON object and print the mandatory 'md' (Mode) field
   Serial.print(F("{\"md\":\""));
   Serial.print(md);
-  Serial.print(F("\"")); // Close quote for 'md' value
-
-  // Include ID if provided
+  Serial.print(F("\""));
+  
   if (id && id[0] != '\0') {
     Serial.print(F(", \"id\":\""));
     Serial.print(id);
     Serial.print(F("\""));
   }
-
-  // Include user name (un) if provided
   if (un && un[0] != '\0') {
     Serial.print(F(", \"un\":\""));
     Serial.print(un);
     Serial.print(F("\""));
   }
-
-  // Include user title (ut) if provided
   if (ut && ut[0] != '\0') {
     Serial.print(F(", \"ut\":\""));
     Serial.print(ut);
     Serial.print(F("\""));
   }
-
-  // Include option (opt) if provided
   if (opt) {
     Serial.print(F(", \"opt\":\""));
     Serial.print(opt);
     Serial.print(F("\""));
   }
-
-  // Include time (tm) if provided
   if (tm && tm[0] != '\0') {
     Serial.print(F(", \"tm\":\""));
     Serial.print(tm);
     Serial.print(F("\""));
   }
-
-  // Close the JSON object and send newline
   Serial.println(F("}"));
 }
 
+// Specialized WiFi JSON packet.
+void sendWifiJson(const char* ssid, const char* pass) {
+  Serial.print(F("{\"md\":\"wifi\",\"SSID\":\""));
+  Serial.print(ssid);
+  Serial.print(F("\",\"PASS\":\""));
+  Serial.print(pass);
+  Serial.println(F("\"}"));
+}
 
-// --- Helper Function for JSON Value Extraction ---
-// Extracts a value for a given key from a JSON buffer. Returns pointer to value or NULL.
+// Lightweight JSON parser: Searches for a key and extracts the value into a result buffer.
 char* extractValue(const char* buffer, const char* key, char* result, int resultSize) {
-  char searchKey[10];
+  char searchKey[32];
   snprintf(searchKey, sizeof(searchKey), "\"%s\":\"", key);
   
   char* start = strstr(buffer, searchKey);
   if (!start) return NULL;
-
+  
   start += strlen(searchKey);
   char* end = strchr(start, '"');
-
+  
   if (end && (end - start) < resultSize) {
     int len = end - start;
     strncpy(result, start, len);
@@ -203,457 +337,382 @@ char* extractValue(const char* buffer, const char* key, char* result, int result
 }
 
 
-// --- Setup ---
+// ----------------------------------------------------------------------------------
+// --- MAIN SYSTEM INITIALIZATION ---
+// ----------------------------------------------------------------------------------
+
 void setup() {
   Serial.begin(9600); 
-
+  
   pinMode(UP_PIN, INPUT_PULLUP);
   pinMode(SELECT_PIN, INPUT_PULLUP);
   pinMode(DOWN_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(ACCEPT_PIN, OUTPUT);
+  pinMode(REJECT_PIN, OUTPUT);
+  pinMode(WIFI_STATUS_PIN, INPUT_PULLUP);
+  pinMode(WIFI_LED, OUTPUT);
+  pinMode(REED_PIN, INPUT_PULLUP);
+  
+  digitalWrite(ACCEPT_PIN, LOW);
+  digitalWrite(REJECT_PIN, LOW);
+  digitalWrite(WIFI_LED, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
   
   lcd.init();
   lcd.backlight();
   lcd.clear();
-
-  SPI.begin(); 	
+  
+  SPI.begin(); 
+  
   mfrc522.PCD_Init(); 
 }
 
-// --- Display Function (16x2 Scrolling) ---
+
+// ----------------------------------------------------------------------------------
+// --- MENU DISPLAY & NAVIGATION ---
+// ----------------------------------------------------------------------------------
+
+// Renders the current menu items with a cursor on the LCD.
 void displayMenu() {
   lcd.clear();
-  char buffer[17]; // Temporary RAM buffer to hold Flash string copy
-
-  // --- Line 0: Selected Item ---
+  char buffer[17];
+  
+  // --- Line 0 (Selected Item) ---
   const char *selectedItemAddr = (const char *)pgm_read_word(&menuItems[currentSelection]);
-  strcpy_P(buffer, selectedItemAddr); 
-  
+  strcpy_P(buffer, selectedItemAddr);
   lcd.setCursor(0, 0);
-  lcd.print(F(">")); // Print selector from Flash
-  lcd.print(buffer); // Print the string from RAM
+  lcd.print(F(">"));
+  lcd.print(buffer);
   
-  // --- Line 1: Next Item ---
+  // --- Line 1 (Next Item - non-selected) ---
   int nextItemIndex = (currentSelection + 1) % MENU_SIZE;
   const char *nextItemAddr = (const char *)pgm_read_word(&menuItems[nextItemIndex]);
-
   strcpy_P(buffer, nextItemAddr); 
-
-  lcd.setCursor(1, 1); // Start at col 1 to align text
-  lcd.print(buffer); // Print the string from RAM
+  lcd.setCursor(0, 1); 
+  lcd.print(F(" "));
+  lcd.print(buffer);
 }
 
-
-// --- Input Handling (Buttons Only) ---
+// Handles tactile input for menu navigation and exits.
 void handleInput() {
-  
-  // 0. POST-ENTRY GUARD: Ignore input immediately after entering the menu
-  if (menuState == 0 && (millis() - menuEntryTime) < POST_ENTRY_DELAY) {
-  	return; 
-  }
-
+  if (menuState == 0 && (millis() - menuEntryTime) < POST_ENTRY_DELAY) return;
   int readingUp = digitalRead(UP_PIN);
   int readingDown = digitalRead(DOWN_PIN);
   int readingSelect = digitalRead(SELECT_PIN);
-
-  // --- Debounce for Up/Down (Action on Press) ---
+  
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-    
-    // Only allow navigation in the Main Menu (menuState == 0)
     if (menuState == 0) {
       if (readingUp == LOW && lastUpState == HIGH) {
-          currentSelection = (currentSelection == 0) ? (MENU_SIZE - 1) : (currentSelection - 1);
-          displayMenu();
-          lastDebounceTime = millis();
+        currentSelection = (currentSelection == 0) ? (MENU_SIZE - 1) : (currentSelection - 1);
+        displayMenu();
+        lastDebounceTime = millis();
       }
-      
       if (readingDown == LOW && lastDownState == HIGH) {
-          currentSelection = (currentSelection + 1) % MENU_SIZE;
-          displayMenu();
-          lastDebounceTime = millis();
+        currentSelection = (currentSelection + 1) % MENU_SIZE;
+        displayMenu();
+        lastDebounceTime = millis();
       }
     }
   }
-
-  // --- SELECT Button Logic (Long Press RETURN/EXIT) ---
   
-  // 1. Detect SELECT Press (start timer)
+  // SELECT Button Logic (Long Press RETURN/EXIT)
   if (readingSelect == LOW && lastSelectState == HIGH) {
-      selectPressStart = millis(); 
-      isLongPressReturnActive = false; 
+    selectPressStart = millis(); 
+    isLongPressReturnActive = false; 
   }
-  
-  // 2. Check for Long Press DURING the hold (IMMEDIATE RETURN/EXIT)
   if (readingSelect == LOW && selectPressStart > 0) {
-      if (!isLongPressReturnActive && (millis() - selectPressStart) >= LONG_PRESS_DURATION) {
-          isLongPressReturnActive = true;
-
-          if (menuState == 0) {
-              menuState = -2; // Exit to Initial State
-              // CRITICAL FIX: Force LCD update immediately when entering scan mode
-              printScreen(F("Scan your card"), F(""));
-          } else {
-              menuState = 0; 	// Return to Main Menu
-              displayMenu();
-          }
-          selectPressStart = 0; 
+    if (!isLongPressReturnActive && (millis() - selectPressStart) >= LONG_PRESS_DURATION) {
+      isLongPressReturnActive = true;
+      if (menuState == 0) {
+        menuState = -2; // Exit to Initial State
+        printScreen(F("Scan your card"), F(""));
       }
-  }
-
-  // 3. Detect SELECT Release (check duration for short press action)
-  if (readingSelect == HIGH && lastSelectState == LOW) {
-      unsigned long pressDuration = millis() - selectPressStart;
-      
-      if (pressDuration > DEBOUNCE_DELAY && !isLongPressReturnActive) { 
-          
-          if (menuState == 0) {
-              // --- Main Menu: SHORT PRESS = SELECT ---
-              menuState = currentSelection + 1; // Transition to action state (e.g., 1 for addUser)
-              // Reset long press timer on successful selection to prevent immediate return
-              selectPressStart = 0; 
-          } 
-          // NOTE: When menuState > 0, the short press is NOT handled here, 
-          // but should be handled by the action function (addUser in this case).
+      else {
+        menuState = 0; // Return to Main Menu
+        displayMenu();
       }
-      
-      lastDebounceTime = millis();
       selectPressStart = 0; 
-      isLongPressReturnActive = false; 
+    }
   }
-  
-  // Update the last stable state for all buttons
+  if (readingSelect == HIGH && lastSelectState == LOW) {
+    unsigned long pressDuration = millis() - selectPressStart;
+    if (pressDuration > DEBOUNCE_DELAY && !isLongPressReturnActive) { 
+      if (menuState == 0) {
+        menuState = currentSelection + 1; // Transition to action state
+        selectPressStart = 0;
+      }
+    }
+    lastDebounceTime = millis();
+    selectPressStart = 0; 
+    isLongPressReturnActive = false; 
+  }
   lastUpState = readingUp;
   lastDownState = readingDown;
   lastSelectState = readingSelect;
 }
 
-// --- Authentication Handler (New) ---
+// ----------------------------------------------------------------------------------
+// --- AUTHENTICATION & SCAN PROCESSES ---
+// ----------------------------------------------------------------------------------
+
 void handleAuthentication() {
-    // Auth Sub-States: 
-    // 0: Scan Prompt (Default)
-    // 1: Wait for Auth Reply
-    // 2: Failure Acknowledge (3s delay)
-    static int authSubState = 0;
-    static char authUserId[17] = ""; 
-    static char authSerialReplyBuffer[MAX_REPLY_BUFFER_SIZE];
-    static int authSerialReplyIndex = 0;
-    static unsigned long authStartTime = 0;
-    static bool displayRunOnce = false;
+  static int authSubState = 0;
+  static char authUserId[17] = "";
+  static unsigned long authStartTime = 0;
+  static bool displayRunOnce = false;
+  static unsigned long authSelectPressStart = 0; 
+  
+  int upReading = digitalRead(UP_PIN);
+  int selectReading = digitalRead(SELECT_PIN);
+  int downReading = digitalRead(DOWN_PIN);
+  
+  bool isHolding = (upReading == LOW && selectReading == LOW);
+  bool wasHolding = (entryPressStart != 0);
 
-    // --- NEW STATIC VARIABLE FOR LONG PRESS EXIT ---
-    static unsigned long authSelectPressStart = 0; 
-    
-    // Read buttons for Long Press Access Check
-    int upReading = digitalRead(UP_PIN);
-    int selectReading = digitalRead(SELECT_PIN);
-    int downReading = digitalRead(DOWN_PIN); // Reading all pins for state update
-    
-    // --- 1. Long Press Access Check (Runs in all AUTH states) ---
-    bool isHolding = (upReading == LOW && selectReading == LOW);
-    bool wasHolding = (entryPressStart != 0);
-
-    if (isHolding) {
-        if (!wasHolding) { // If hold just started
-            entryPressStart = millis();
-            printScreen(F("ENTERING MENU..."), F("")); 
-        } else {
-            if (millis() - entryPressStart >= MENU_ENTRY_DURATION) {
-                // SUCCESS: Long press detected, transition to AUTH scan state
-                menuState = -3; // Move to the dedicated Authentication Scan state
-                entryPressStart = 0; 
-                authSubState = 0; // Ensure substate is set to Scan Prompt
-                displayRunOnce = false; // CRITICAL FIX: Force prompt display
-                
-                // *** CRITICAL SYNCHRONIZATION FIX ***
-                // 1. Reset 2-second exit timer completely on 5s success.
-                authSelectPressStart = 0; 
-
-                // 2. Manually register button release BEFORE returning, preventing the next cycle's abort check from running.
-                lastUpState = HIGH;
-                lastSelectState = HIGH;
-                
-                return; 
-            } 
-        }
-    } else {
-        // If we were holding but released before success (failed entry)
-        if (wasHolding && menuState != -3) { // Only abort if we haven't successfully transitioned yet
-            entryPressStart = 0; // Reset the timer
-            menuState = -2; 
-            mainScanDisplayDrawn = false; // FIX: Force mainCardScan to redraw immediately
-            return;
-        }
+  if (isHolding) {
+    if (!wasHolding) {
+      entryPressStart = millis();
+      printScreen(F("ENTERING MENU..."), F("")); 
     }
-    
-    // --- 2. Authentication Sub-States (Only run if menuState == -3) ---
-    if (menuState != -3) {
-        // Fallback: If not triggered by long press, run transaction scan
-        mainCardScan();
-        
-        // --- CRITICAL FIX: UPDATE GLOBAL BUTTON STATE IN SCAN/AUTH MODE ---
-        lastUpState = upReading;
-        lastDownState = downReading;
-        lastSelectState = selectReading;
+    else {
+      if (millis() - entryPressStart >= MENU_ENTRY_DURATION) {
+        if (menuState == -2 && !wifiConnected) {
+          menuState = 3; // Settings
+          requestDirectWifiEntry = true;
+        }
+        else {
+          menuState = -3; // Authentication Scan state
+          entryPressStart = 0;
+          authSubState = 0;
+          displayRunOnce = false;
+          authSelectPressStart = 0;
+          lastUpState = HIGH;
+          lastSelectState = HIGH;
+        }
         return;
+      }
     }
-    
-    // --- NEW: LONG PRESS OK EXIT CHECK (Only runs if menuState == -3) ---
-    
-    // 1. Detect SELECT Press (start timer)
-    if (selectReading == LOW && lastSelectState == HIGH) {
-        authSelectPressStart = millis(); 
+  }
+  else {
+    if (wasHolding && menuState != -3) {
+      entryPressStart = 0;
+      menuState = -2; 
+      mainScanDisplayDrawn = false;
+      return;
     }
-    
-    // 2. Check for Long Press DURING the hold (IMMEDIATE EXIT)
-    if (selectReading == LOW && authSelectPressStart > 0) {
-        if (millis() - authSelectPressStart >= LONG_PRESS_DURATION) {
-            // Long Press detected -> EXIT AUTH
-            menuState = -2;
-            authSubState = 0; // Reset auth state machine
-            mainScanDisplayDrawn = false; // Force immediate redraw of main scan screen
-            printScreen(F("Scan your card"), F(""));
-            authSelectPressStart = 0; // Reset timer
-            // CRITICAL: Force the selection to look released globally to prevent handleInput() misfire later
-            lastSelectState = HIGH; 
-            return;
-        }
-    }
-    
-    // 3. Detect SELECT Release (end timer) - This consumes short presses in Auth mode
-    if (selectReading == HIGH && lastSelectState == LOW) {
-        authSelectPressStart = 0;
-    }
-
-    // --- Start Sub-State Logic (Only runs if not exiting) ---
-    
-    switch (authSubState) {
-        case 0: // Auth Scan Prompt
-            if (!displayRunOnce) {
-                // FIX: Ensure this is the ONLY Auth display in this block
-                printScreen(F("Auth. scan card"), F("waiting...."));
-                Serial.readStringUntil('\n');
-                displayRunOnce = true;
-                mfrc522.PCD_Init(); 
-                authSerialReplyIndex = 0; 
-            }
-
-            if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-                // Store UID
-                memset(authUserId, 0, sizeof(authUserId));
-                for (byte i = 0; i < mfrc522.uid.size; i++) {
-                    sprintf(authUserId + (i * 2), "%02X", mfrc522.uid.uidByte[i]);
-                }
-                
-                // Send authentication request
-                sendSerialJson(F("auth"), authUserId, NULL, NULL, NULL, NULL);
-
-                // Transition to wait state
-                authSubState = 1; 
-                displayRunOnce = false;
-                authStartTime = millis();
-            }
-            break;
-
-        case 1: // Wait for Auth Reply
-            if (!displayRunOnce) {
-                printScreen(F("Scanned Card"), F("Processing...."));
-                displayRunOnce = true;
-            }
-
-            // Check for Timeout
-            if (millis() - authStartTime > SERIAL_TIMEOUT) {
-                printScreen(F("Auth Timeout!"), F("Try again."));
-                authSubState = 0; 
-                displayRunOnce = false;
-                delay(SCAN_DISPLAY_TIME); // Blocking delay to show error
-                return;
-            }
-            
-            // Non-blocking serial read
-            while (Serial.available()) {
-                char inChar = Serial.read();
-                
-                // CRITICAL FIX: Only capture characters that might be part of JSON or the newline terminator
-                if (inChar != '\r' && inChar != '\n') {
-                    if (authSerialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-                        authSerialReplyBuffer[authSerialReplyIndex++] = inChar;
-                        authSerialReplyBuffer[authSerialReplyIndex] = '\0'; 
-                    }
-                }
-                
-                // Check for NEWLINE (End of transmission)
-                if (inChar == '\n') {
-                    char result[12]; // Buffer for "admin" or "not-admin"
-                    
-                    // --- ATTEMPT TO PARSE ---
-                    if (extractValue(authSerialReplyBuffer, "rslt", result, sizeof(result))) {
-                        if (strcmp(result, "admin") == 0) {
-                            // SUCCESS: Admin granted access
-                            menuState = 0; // Enter Main Menu
-                            menuEntryTime = millis(); 
-                            displayMenu();
-                        } else {
-                            // FAILURE: Not admin
-                            authSubState = 2; // Go to failure acknowledge state
-                            authStartTime = millis(); // Start 3s timer
-                        }
-                    } else {
-                        // JSON parsing failed
-                        printScreen(F("AUTH JSON ERROR!"), F("Restart host."));
-                        Serial.readStringUntil('\n');
-                        authSubState = 0; // Reset to scan
-                        delay(SCAN_DISPLAY_TIME);
-                    }
-                    displayRunOnce = false;
-                    authSerialReplyIndex = 0;
-                    return;
-                }
-            }
-            break;
-
-        case 2: // Failure Acknowledge (3s delay)
-            if (!displayRunOnce) {
-                printScreen(F("User - not admin"), F("reverting..."));
-                displayRunOnce = true;
-            }
-            
-            if (millis() - authStartTime > SCAN_DISPLAY_TIME) {
-                // 3 seconds passed, revert to main scan loop
-                menuState = -2; // Exit authentication state
-                displayRunOnce = false;
-            }
-            break;
-    }
-    
-    // --- CRITICAL FIX: UPDATE GLOBAL BUTTON STATE IN AUTH MODE ---
+  }
+  
+  if (menuState != -3) {
+    mainCardScan();
     lastUpState = upReading;
     lastDownState = downReading;
     lastSelectState = selectReading;
+    return;
+  }
+  
+  // AUTH mode long-press-ok exit
+  if (selectReading == LOW && lastSelectState == HIGH) {
+    authSelectPressStart = millis(); 
+  }
+  if (selectReading == LOW && authSelectPressStart > 0) {
+    if (millis() - authSelectPressStart >= LONG_PRESS_DURATION) {
+      menuState = -2;
+      authSubState = 0;
+      mainScanDisplayDrawn = false;
+      printScreen(F("Scan your card"), F(""));
+      authSelectPressStart = 0;
+      lastSelectState = HIGH; 
+      return;
+    }
+  }
+  if (selectReading == HIGH && lastSelectState == LOW) {
+    authSelectPressStart = 0;
+  }
+
+  switch (authSubState) {
+    case 0: // Waiting for Admin Scan
+      if (!displayRunOnce) {
+        printScreen(F("Auth. scan card"), F("waiting...."));
+        while (Serial.available()) Serial.read();
+        displayRunOnce = true;
+        mfrc522.PCD_Init(); 
+        g_serial_index = 0;
+      }
+
+      if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+        memset(authUserId, 0, sizeof(authUserId));
+        for (byte i = 0; i < mfrc522.uid.size; i++) {
+          sprintf(authUserId + (i * 2), "%02X", mfrc522.uid.uidByte[i]);
+        }
+        sendSerialJson(F("auth"), authUserId, NULL, NULL, NULL, NULL);
+        authSubState = 1; 
+        displayRunOnce = false;
+        authStartTime = millis();
+      }
+      break;
+
+    case 1: // Processing JSON Response
+      if (!displayRunOnce) {
+        printScreen(F("Scanned Card"), F("Processing...."));
+        displayRunOnce = true;
+      }
+      if (millis() - authStartTime > SERIAL_TIMEOUT) {
+        printScreen(F("Auth Timeout!"), F("Try again."));
+        authSubState = 0;
+        displayRunOnce = false;
+        delay(SCAN_DISPLAY_TIME);
+        return;
+      }
+      while (Serial.available()) {
+        char inChar = Serial.read();
+        if (inChar != '\r' && inChar != '\n') {
+          if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+            g_serial_buffer[g_serial_index++] = inChar;
+            g_serial_buffer[g_serial_index] = '\0'; 
+          }
+        }
+        if (inChar == '\n') {
+          if (extractValue(g_serial_buffer, "rslt", g_temp_extract_buffer, sizeof(g_temp_extract_buffer))) {
+            if (strcmp(g_temp_extract_buffer, "admin") == 0) {
+              menuState = 0; // Enter Main Menu
+              menuEntryTime = millis(); 
+              displayMenu();
+            } else {
+              authSubState = 2; // Not admin
+              authStartTime = millis();
+            }
+          } else {
+            printScreen(F("AUTH JSON ERROR!"), F("Restart host."));
+            Serial.readStringUntil('\n');
+            authSubState = 0; // Reset to scan
+            delay(SCAN_DISPLAY_TIME);
+          }
+          displayRunOnce = false;
+          g_serial_index = 0; // Reset global index
+          return;
+        }
+      }
+      break;
+
+    case 2: // Failure Acknowledge (3s delay)
+      if (!displayRunOnce) {
+        printScreen(F("User - not admin"), F("reverting..."));
+        displayRunOnce = true;
+      }
+      if (millis() - authStartTime > SCAN_DISPLAY_TIME) {
+        menuState = -2; // Exit authentication state
+        displayRunOnce = false;
+      }
+      break;
+  }
+  lastUpState = upReading;
+  lastDownState = downReading;
+  lastSelectState = selectReading;
 }
 
-// --- Simple Scan Handler (If not in auth state) ---
-// --- Simple Scan Handler (If not in auth state) ---
+// Simple Scan Handler (If not in auth state - Updated to use shared buffers)
 void mainCardScan() {
-  // Sub-States: 
-  // 0: Scan (Idle)
-  // 1: Wait for Host Reply
-  // 2: Tap In Result
-  // 3: Tap Out / Already Tapped (Stage 1)
-  // 4: Tap Out / Already Tapped (Stage 2: Duration/Retry)
-  // 5: JSON Error / Timeout
-  // 6: User Not Found (New state)
   static int subState = 0; 
   static unsigned long transactionStartTime = 0;
-  static char scanReplyBuffer[MAX_SCAN_BUFFER_SIZE]; 
-  static int serialReplyIndex = 0;
-  // bool displayRunOnce is now GLOBAL (mainScanDisplayDrawn)
-  static bool stage2Ready = false; // Flag to check if it's time for the second stage display
-  
-  // Extracted data buffers (larger for name)
+  static bool stage2Ready = false;
   static char userName[MAX_NAME_SIZE]; 
-  static char actionType[5]; // IN, OUT, FAIL
-  static char timeValue[9]; // HH:MM:SS
-  static char durationValue[9]; // HH:MM:SS
-  static char retryValue[9]; // HH:MM:SS
-
-  // --- Sub-State 0: Scan (Idle) ---
+  static char actionType[8]; // IN, OUT, FAIL
+  static char timeValue[16]; // HH:MM:SS or larger
+  static char durationValue[16];
+  static char retryValue[16];
+  
   if (subState == 0) {
     if (!mainScanDisplayDrawn) {
       printScreen(F("Scan your card"), F(""));
-      Serial.readStringUntil('\n');
+      while (Serial.available()) Serial.read();
       mainScanDisplayDrawn = true;
       mfrc522.PCD_Init(); 
     }
-
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      char userId[17];
+      char userId[33];
       memset(userId, 0, sizeof(userId));
-      
       for (byte i = 0; i < mfrc522.uid.size; i++) {
         sprintf(userId + (i * 2), "%02X", mfrc522.uid.uidByte[i]);
       }
-      
-      // Send scan request
       sendSerialJson(F("scan"), userId, NULL, NULL, NULL, NULL);
-
-      // Transition to wait state
       subState = 1; 
       mainScanDisplayDrawn = false;
       transactionStartTime = millis();
-      serialReplyIndex = 0;
+      g_serial_index = 0;
     }
   }
-
-  // --- Sub-State 1: Wait for Host Reply ---
+  
   else if (subState == 1) {
     if (!mainScanDisplayDrawn) {
-      // FIX: Display Scan / Processing....
       printScreen(F("Scan"), F("Processing...."));
       mainScanDisplayDrawn = true;
-    }
-
-    // Check for Timeout
+    } 
     if (millis() - transactionStartTime > SERIAL_TIMEOUT) {
       printScreen(F("Timeout!"), F("Try again."));
       subState = 0;
       mainScanDisplayDrawn = false;
-      delay(SCAN_DISPLAY_TIME); // Blocking delay to show error
+      delay(SCAN_DISPLAY_TIME);
       return;
     }
     
-    // Non-blocking serial read
     while (Serial.available()) {
       char inChar = Serial.read();
-      
-      // Safety check against buffer overflow
-      if (serialReplyIndex < MAX_SCAN_BUFFER_SIZE - 1) {
-        scanReplyBuffer[serialReplyIndex++] = inChar;
-        scanReplyBuffer[serialReplyIndex] = '\0'; 
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+        g_serial_buffer[g_serial_index++] = inChar;
+        g_serial_buffer[g_serial_index] = '\0'; 
         
-        // If closing brace is found, attempt to parse the full message
         if (inChar == '}') {
-          
-          // --- NEW CHECK: User Not Found ---
-          if (strstr(scanReplyBuffer, "\"rslt\":\"NF\"")) {
-            subState = 6; // Go to User Not Found state
-            transactionStartTime = millis(); // Start 3s timer
+          // Check for User Not Found
+          if (strstr(g_serial_buffer, "\"rslt\":\"NF\"")) {
+            subState = 6; // User Not Found
+            transactionStartTime = millis();
             mainScanDisplayDrawn = false;
-            serialReplyIndex = 0;
-            return; // Exit state
+            g_serial_index = 0;
+            return;
           }
-          
-          // --- Attempt to Parse Standard Transaction ---
-          if (extractValue(scanReplyBuffer, "nm", userName, sizeof(userName)) &&
-              extractValue(scanReplyBuffer, "act", actionType, sizeof(actionType))) {
+          // Parse full response
+          if (extractValue(g_serial_buffer, "nm", userName, sizeof(userName)) && extractValue(g_serial_buffer, "act", actionType, sizeof(actionType))) {
+            extractValue(g_serial_buffer, "tm", timeValue, sizeof(timeValue));
+            extractValue(g_serial_buffer, "dur", durationValue, sizeof(durationValue));
+            extractValue(g_serial_buffer, "rtr", retryValue, sizeof(retryValue));
+            transactionStartTime = millis();
             
-            // Mandatory fields found. Parse optional fields.
-            extractValue(scanReplyBuffer, "tm", timeValue, sizeof(timeValue));
-            extractValue(scanReplyBuffer, "dur", durationValue, sizeof(durationValue));
-            extractValue(scanReplyBuffer, "rtr", retryValue, sizeof(retryValue));
-
-            transactionStartTime = millis(); // Reset timer for result display
-            
-            // --- Transition to Result State ---
             if (strcmp(actionType, "IN") == 0) {
-              subState = 2; // Tap In (Simple 1-stage display)
-            } else if (strcmp(actionType, "OUT") == 0 || strcmp(actionType, "FAIL") == 0) {
-              subState = 3; // Tap Out / Already Tapped (2-stage display)
-            } else {
-              // Unknown action
-              subState = 5; 
+              subState = 2;
+              beepOnce();
+              pulseAccept(); // ADDED: Activate pin for IN (Success)
             }
-          } else {
-            // Failed to find name or action
+            else if (strcmp(actionType, "OUT") == 0) {
+              subState = 3;
+              beepOnce();
+              pulseAccept();
+            }
+            else if (strcmp(actionType, "FAIL") == 0) {
+              subState = 3; // Use state 3 for dual-display failure
+              beepTwice();
+              pulseReject();
+              stage2Ready = false;
+            }
+            else {
+              subState = 5;
+              beepTwice();
+              pulseReject();
+            }
+          }
+          else {
             subState = 5;
+            beepTwice();
+            pulseReject();
           }
           mainScanDisplayDrawn = false;
-          serialReplyIndex = 0;
-          return; // Exit state after successful parse or failure
+          g_serial_index = 0;
+          return;
         } 
       }
     }
   }
-
-  // --- Sub-State 2: Tap In Result (1-Stage Display) ---
+  
   else if (subState == 2) {
     if (!mainScanDisplayDrawn) {
       char line2[17];
@@ -661,267 +720,209 @@ void mainCardScan() {
       printScreen(userName, line2);
       mainScanDisplayDrawn = true;
     }
-
-    // Wait for SCAN_DISPLAY_TIME, then reset to idle
-    if (millis() - transactionStartTime > SCAN_DISPLAY_TIME) {
-      subState = 0; 
-      mainScanDisplayDrawn = false;
-    }
-  }
-
-  // --- Sub-State 3: Tap Out / Already Tapped (Stage 1) ---
-  else if (subState == 3) {
-    if (!mainScanDisplayDrawn) {
-      char line2[17];
-      
-      if (strcmp(actionType, "OUT") == 0) {
-        snprintf(line2, sizeof(line2), "OUT %s", timeValue);
-      } else { // FAIL
-        strcpy(line2, "Already Tapped");
-      }
-      
-      printScreen(userName, line2);
-      mainScanDisplayDrawn = true;
-      stage2Ready = false; // Prepare for stage 2
-    }
-
-    // Wait for SCAN_DISPLAY_TIME, then transition to Stage 2
-    if (!stage2Ready && (millis() - transactionStartTime > SCAN_DISPLAY_TIME)) {
-      subState = 4; // Move to Stage 2
-      mainScanDisplayDrawn = false;
-      transactionStartTime = millis(); // Reset timer for stage 2 display
-      stage2Ready = true; // Prevents re-entry into this check
-    }
-  }
-
-  // --- Sub-State 4: Tap Out / Already Tapped (Stage 2) ---
-  else if (subState == 4) {
-    if (!mainScanDisplayDrawn) {
-      char line1[17];
-      char line2[17];
-
-      if (strcmp(actionType, "OUT") == 0) {
-        // Tap Out: Show Duration
-        strcpy(line1, "Duration");
-        strcpy(line2, durationValue);
-      } else { // FAIL (Already Tapped)
-        // Already Tapped: Show Retry Time
-        strcpy(line1, "Try after");
-        strcpy(line2, retryValue);
-      }
-      
-      printScreen(line1, line2);
-      mainScanDisplayDrawn = true;
-    }
-
-    // Wait for SCAN_DISPLAY_TIME, then reset to idle
-    if (millis() - transactionStartTime > SCAN_DISPLAY_TIME) {
-      subState = 0; 
-      mainScanDisplayDrawn = false;
-      stage2Ready = false;
-    }
-  }
-
-  // --- Sub-State 5: JSON Error / Unknown Action ---
-  else if (subState == 5) {
-    if (!mainScanDisplayDrawn) {
-      printScreen(F("JSON Error!"), F("Reset host system."));
-      mainScanDisplayDrawn = true;
-    }
-    // Simple 3-second delay, then reset
     if (millis() - transactionStartTime > SCAN_DISPLAY_TIME) {
       subState = 0; 
       mainScanDisplayDrawn = false;
     }
   }
   
-  // --- NEW Sub-State 6: User Not Found ---
+  else if (subState == 3) {
+    if (!mainScanDisplayDrawn) {
+      char line2[17];
+      if (strcmp(actionType, "OUT") == 0) {
+        snprintf(line2, sizeof(line2), "OUT %s", timeValue);
+      }
+      else { // FAIL or already tapped
+        strcpy(line2, "Already Tapped");
+      }
+      printScreen(userName, line2);
+      mainScanDisplayDrawn = true;
+      stage2Ready = false;
+    }
+    // If this is a single display message (e.g., simple error), move to subState 4 immediately for the next screen
+    if (!stage2Ready && (millis() - transactionStartTime > SCAN_DISPLAY_TIME)) {
+      subState = 4;
+      mainScanDisplayDrawn = false;
+      transactionStartTime = millis();
+      stage2Ready = true;
+    }
+  }
+  
+  else if (subState == 4) {
+    if (!mainScanDisplayDrawn) {
+      char line1[17], line2[17];
+      if (strcmp(actionType, "OUT") == 0) {
+        strcpy(line1, "Duration");
+        strncpy(line2, durationValue, 16);
+        line2[16] = '\0';
+      }
+      else if (strcmp(actionType, "FAIL") == 0) {
+        strcpy(line1, "Try after");
+        strncpy(line2, retryValue, 16);
+        line2[16] = '\0';
+      }
+      else {
+        strcpy(line1, "Wait for next");
+        strcpy(line2, "entry cycle");
+      }
+      printScreen(line1, line2);
+      mainScanDisplayDrawn = true;
+    }
+    
+    if (millis() - transactionStartTime > SCAN_DISPLAY_TIME) {
+      subState = 0; 
+      mainScanDisplayDrawn = false;
+      stage2Ready = false;
+    }
+  }
+  
+  else if (subState == 5) {
+    if (!mainScanDisplayDrawn) {
+      printScreen(F("JSON Error!"), F("Reset host system."));
+      mainScanDisplayDrawn = true;
+    }
+    if (millis() - transactionStartTime > SCAN_DISPLAY_TIME) {
+      subState = 0; 
+      mainScanDisplayDrawn = false;
+    }
+  }
+  
   else if (subState == 6) {
     if (!mainScanDisplayDrawn) {
       printScreen(F("User not found"), F("Please Register"));
       mainScanDisplayDrawn = true;
     }
-    // Wait for SCAN_DISPLAY_TIME, then reset to idle
     if (millis() - transactionStartTime > SCAN_DISPLAY_TIME) {
-      subState = 0; // Return to Scan (Idle) mode
+      subState = 0; 
       mainScanDisplayDrawn = false;
     }
   }
 }
 
-// ================= CHAR TABLE FOR NAME SCROLLING =================
+// ----------------------------------------------------------------------------------
+// --- MENU FUNCTIONS & NAVIGATION ---
+// ----------------------------------------------------------------------------------
+
+// CHAR TABLE FOR NAME SCROLLING
 const char CHAR_TABLE[] =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  "*ABCDEFGHIJKLMNOPQRSTUVWXYZ"
   "abcdefghijklmnopqrstuvwxyz"
+  "!@#$%^&*"
   "0123456789"
   " ";
-
 const int CHAR_TABLE_SIZE = sizeof(CHAR_TABLE) - 1;
 
-
-// ===================== ADD USER FUNCTION =========================
 void addUser() {
-
-  // Substates:
-  // 0 = Scan ID
-  // 1 = Wait search reply
-  // 2 = Enter name
-  // 3 = Select title
-  // 4 = Wait add reply
-  // 5 = Acknowledge added
-  // 6 = ID already exists
-
   static int subState = 0;
-  static char userId[17] = "";
+  static char userId[33] = "";
   static char userName[MAX_NAME_SIZE];
   static char userTitle[6] = "admin";
-
   static int nameCharIndex = 0;
   static int okPressCount = 0;
   static bool isTitleAdmin = true;
   static bool displayUpdateNeeded = true;
-
   static unsigned long lastCharUpdateTime = 0;
   const unsigned long CHAR_SCROLL_DELAY = 150;
-
-  static char serialReplyBuffer[MAX_REPLY_BUFFER_SIZE];
-  static int serialReplyIndex = 0;
-
   static int localLastUpState = HIGH;
   static int localLastDownState = HIGH;
   static int localLastSelectState = HIGH;
-
   int upReading = digitalRead(UP_PIN);
   int downReading = digitalRead(DOWN_PIN);
   int selectReading = digitalRead(SELECT_PIN);
 
-
-
-  // ================================================================
-  // EXIT WHEN MENUSTATE CHANGES
-  // ================================================================
   if (menuState != 1) {
-
     subState = 0;
     memset(userId, 0, sizeof(userId));
     memset(userName, 0, sizeof(userName));
-    strcpy(userTitle, "admin");
-
     nameCharIndex = 0;
+    strcpy(userTitle, "admin");
     okPressCount = 0;
     isTitleAdmin = true;
     displayUpdateNeeded = true;
-
-    serialReplyIndex = 0;
-    memset(serialReplyBuffer, 0, sizeof(serialReplyBuffer));
-
+    g_serial_index = 0;
+    memset(g_serial_buffer, 0, sizeof(g_serial_buffer));
     localLastUpState = HIGH;
     localLastDownState = HIGH;
     localLastSelectState = HIGH;
-
     return;
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 0: Scan ID
-  // ================================================================
   if (subState == 0) {
-
     if (displayUpdateNeeded) {
       printScreen(F("Scan User ID"), F("Waiting..."));
       displayUpdateNeeded = false;
-      serialReplyIndex = 0;
+      g_serial_index = 0;
       mfrc522.PCD_Init();
     }
 
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-
       memset(userId, 0, sizeof(userId));
-
       for (byte i = 0; i < mfrc522.uid.size; i++) {
         sprintf(userId + i * 2, "%02X", mfrc522.uid.uidByte[i]);
       }
-
       sendSerialJson(F("search"), userId, NULL, NULL, NULL, NULL);
       printScreen(F("Searching..."), userId);
-
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
-
       subState = 1;
       displayUpdateNeeded = true;
     }
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 1: Wait for Search Reply
-  // ================================================================
   else if (subState == 1) {
-
     while (Serial.available()) {
       char c = Serial.read();
-
-      if (serialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-        serialReplyBuffer[serialReplyIndex++] = c;
-        serialReplyBuffer[serialReplyIndex] = '\0';
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+        g_serial_buffer[g_serial_index++] = c;
+        g_serial_buffer[g_serial_index] = '\0';
       }
-
-      if (strstr(serialReplyBuffer, "\"rslt\":\"F\"")) {
-        subState = 6;
-        displayUpdateNeeded = true;
-        serialReplyIndex = 0;
-        break;
-      } else if (strstr(serialReplyBuffer, "\"rslt\":\"NF\"")) {
-        subState = 2;
-        displayUpdateNeeded = true;
-        serialReplyIndex = 0;
-        break;
+      if (c == '\n' || strstr(g_serial_buffer, "}")) {
+        if (strstr(g_serial_buffer, "\"rslt\":\"F\"")) {
+          subState = 6;
+          displayUpdateNeeded = true;
+          g_serial_index = 0;
+          break;
+        }
+        else if (strstr(g_serial_buffer, "\"rslt\":\"NF\"")) {
+          subState = 2;
+          displayUpdateNeeded = true;
+          g_serial_index = 0;
+          break;
+        }
       }
     }
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 2: ENTER NAME (A-Z, a-z, 0-9, space)
-  // ================================================================
   else if (subState == 2) {
-
-    // static vars unique to this state
     static bool nameInit = true;
     static int charIndex = 0;
     static char currentLetter;
 
     if (nameInit) {
-      nameInit = false;
       charIndex = 0;
       currentLetter = CHAR_TABLE[charIndex];
+      nameCharIndex = 0;
+      memset(userName, 0, sizeof(userName));
+      okPressCount = 0;
       displayUpdateNeeded = true;
+      nameInit = false;
     }
 
     char line1[17];
     char line2[17];
 
-
-    // --- Letter scroll ---
     if (millis() - lastCharUpdateTime > CHAR_SCROLL_DELAY) {
-
       bool scrolled = false;
-
       if (upReading == LOW) {
         charIndex--;
         if (charIndex < 0) charIndex = CHAR_TABLE_SIZE - 1;
         scrolled = true;
-      } else if (downReading == LOW) {
+      }
+      else if (downReading == LOW) {
         charIndex++;
         if (charIndex >= CHAR_TABLE_SIZE) charIndex = 0;
         scrolled = true;
       }
-
       if (scrolled) {
         currentLetter = CHAR_TABLE[charIndex];
         lastCharUpdateTime = millis();
@@ -930,71 +931,56 @@ void addUser() {
       }
     }
 
-
-    // --- Select pressed ---
     if (selectReading == HIGH && localLastSelectState == LOW) {
-
-      if (okPressCount == 1) {
-        // final name done
+      if (currentLetter == '*') {
         nameInit = true;
         subState = 3;
-        okPressCount = 0;
         displayUpdateNeeded = true;
+        localLastSelectState = HIGH;
         return;
       }
-
+      if (okPressCount == 1) { // Second press on the same char
+        nameInit = true;
+        subState = 3;
+        displayUpdateNeeded = true;
+        localLastSelectState = HIGH;
+        return;
+      }
       if (nameCharIndex < MAX_NAME_SIZE - 1) {
         userName[nameCharIndex++] = currentLetter;
         userName[nameCharIndex] = '\0';
-
         charIndex = 0;
         currentLetter = CHAR_TABLE[charIndex];
-
         okPressCount = 1;
         displayUpdateNeeded = true;
       }
     }
 
-
-    // --- Display ---
     if (displayUpdateNeeded) {
       snprintf(line1, sizeof(line1), "Name: %s", userName);
       snprintf(line2, sizeof(line2), "%c Char %d: <%c>",
-               okPressCount == 0 ? '>' : '!',
-               nameCharIndex + 1,
-               currentLetter);
-
+      okPressCount == 0 ? '>' : '!',
+      nameCharIndex + 1,
+      currentLetter);
       printScreen(line1, line2);
       displayUpdateNeeded = false;
     }
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 3: SELECT TITLE
-  // ================================================================
   else if (subState == 3) {
-
-    if ((upReading == LOW && localLastUpState == HIGH) ||
-        (downReading == LOW && localLastDownState == HIGH)) {
-
+    if ((upReading == LOW && localLastUpState == HIGH) || (downReading == LOW && localLastDownState == HIGH)) {
       isTitleAdmin = !isTitleAdmin;
       strcpy(userTitle, isTitleAdmin ? "admin" : "user");
       displayUpdateNeeded = true;
     }
-
     if (selectReading == HIGH && localLastSelectState == LOW) {
-
       printScreen(F("Adding user"), F("Processing..."));
       sendSerialJson(F("add"), userId, userName, userTitle, NULL, NULL);
-
       subState = 4;
       displayUpdateNeeded = true;
-      serialReplyIndex = 0;
+      g_serial_index = 0;
       return;
     }
-
     if (displayUpdateNeeded) {
       char line2[17];
       snprintf(line2, sizeof(line2), "Title: <%s>", userTitle);
@@ -1003,44 +989,30 @@ void addUser() {
     }
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 4: WAIT FOR ADD REPLY
-  // ================================================================
   else if (subState == 4) {
-
     while (Serial.available()) {
       char c = Serial.read();
-
-      if (serialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-        serialReplyBuffer[serialReplyIndex++] = c;
-        serialReplyBuffer[serialReplyIndex] = '\0';
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+        g_serial_buffer[g_serial_index++] = c;
+        g_serial_buffer[g_serial_index] = '\0';
       }
-
-      if (strstr(serialReplyBuffer, "\"rslt\":\"A\"")) {
-        subState = 5;
-        displayUpdateNeeded = true;
-        serialReplyIndex = 0;
-        break;
+      if (c == '\n' || strstr(g_serial_buffer, "}")) {
+        if (strstr(g_serial_buffer, "\"rslt\":\"A\"")) {
+          subState = 5;
+          displayUpdateNeeded = true;
+          g_serial_index = 0;
+          break;
+        }
       }
     }
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 5: USER ADDED
-  // ================================================================
   else if (subState == 5) {
-
     if (displayUpdateNeeded) {
       printScreen(F("User added"), F("Press OK to exit"));
       displayUpdateNeeded = false;
     }
-
     if (selectReading == HIGH && localLastSelectState == LOW) {
-
       subState = 0;
       menuState = 0;
       displayMenu();
@@ -1048,20 +1020,12 @@ void addUser() {
     }
   }
 
-
-
-  // ================================================================
-  // SUBSTATE 6: ID EXISTS
-  // ================================================================
   else if (subState == 6) {
-
     if (displayUpdateNeeded) {
       printScreen(F("ID exists"), F("Press OK to exit"));
       displayUpdateNeeded = false;
     }
-
     if (selectReading == HIGH && localLastSelectState == LOW) {
-
       subState = 0;
       menuState = 0;
       displayMenu();
@@ -1069,35 +1033,15 @@ void addUser() {
     }
   }
 
-
-
-  // ================================================================
-  // UPDATE LOCAL BUTTON STATES
-  // ================================================================
   localLastUpState = upReading;
   localLastDownState = downReading;
   localLastSelectState = selectReading;
 }
 
-
-
 void deleteUser() {
-  // Static variables for state management and data storage
-  // subState definitions:
-  // 0: Scan
-  // 1: Wait for Search Reply
-  // 2: Confirmation (Delete? Yes/No)
-  // 3: Wait for Delete Reply
-  // 4: Acknowledge Not Found
-  // 5: Acknowledge Deleted (Wait for OK)
-  // 6: Finalize Cancelled (Auto-return)
   static int subState = 0; 
-  static char scannedUserId[17] = ""; 
+  static char scannedUserId[33] = "";
   static bool displayUpdateNeeded = true;
-  static char serialReplyBuffer[MAX_REPLY_BUFFER_SIZE]; // Buffer for incoming serial response
-  static int serialReplyIndex = 0;
-  
-  // Local button state tracking for single-press actions
   static int localLastUpState = HIGH;
   static int localLastDownState = HIGH;
   static int localLastSelectState = HIGH;
@@ -1105,11 +1049,10 @@ void deleteUser() {
   int downReading = digitalRead(DOWN_PIN);
   int selectReading = digitalRead(SELECT_PIN);
 
-  // --- State Check (Used for cleanup after global long-press exit) ---
   if (menuState != 2) { 
     subState = 0; 
     memset(scannedUserId, 0, sizeof(scannedUserId));
-    serialReplyIndex = 0;
+    g_serial_index = 0;
     displayUpdateNeeded = true; 
     localLastUpState = HIGH;
     localLastDownState = HIGH;
@@ -1117,562 +1060,734 @@ void deleteUser() {
     return; 
   }
 
-  // --- SUB-STATE 0: Scan RFID ID ---
   if (subState == 0) {
     if (displayUpdateNeeded) {
-      // FIX: Display "Delete user" and "Scan your card"
       printScreen(F("Delete user"), F("Scan your card"));
       displayUpdateNeeded = false;
-      serialReplyIndex = 0; // Clear any old reply data
+      g_serial_index = 0;
       mfrc522.PCD_Init();
     }
-    
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      
-      // Store UID
       memset(scannedUserId, 0, sizeof(scannedUserId));
       for (byte i = 0; i < mfrc522.uid.size; i++) {
         sprintf(scannedUserId + (i * 2), "%02X", mfrc522.uid.uidByte[i]);
       }
-      
-      // 1. Send search request to serial monitor (Optimized)
       sendSerialJson(F("search"), scannedUserId, NULL, NULL, NULL, NULL);
-      
       mfrc522.PICC_HaltA(); 
       mfrc522.PCD_StopCrypto1(); 
-      
-      subState = 1; // Move to Wait for Search Reply
+      subState = 1;
       displayUpdateNeeded = true; 
     }
   }
-  
-  // --- SUB-STATE 1: Wait for Serial Search Reply ---
+
   else if (subState == 1) {
-    if (displayUpdateNeeded) {
-      // FIX: Use Flash, RAM overload
+    if (displayUpdateNeeded) { 
       printScreen(F("Searching..."), scannedUserId);
-      displayUpdateNeeded = false;
+      displayUpdateNeeded = false; 
     }
-    
-    // Non-blocking serial read and simplified search
     while (Serial.available()) {
       char inChar = Serial.read();
-      if (serialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-        serialReplyBuffer[serialReplyIndex++] = inChar;
-        serialReplyBuffer[serialReplyIndex] = '\0'; 
-        
-        // Check for positive result
-        if (strstr(serialReplyBuffer, "\"rslt\":\"F\"")) {
-          subState = 2; // Found -> Go to Confirmation
-          displayUpdateNeeded = true;
-          serialReplyIndex = 0;
-          break; 
-        } 
-        // Check for negative result
-        else if (strstr(serialReplyBuffer, "\"rslt\":\"NF\"")) {
-          subState = 4; // Not Found -> Go to Acknowledge Not Found
-          displayUpdateNeeded = true;
-          serialReplyIndex = 0;
-          break;
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+        g_serial_buffer[g_serial_index++] = inChar;
+        g_serial_buffer[g_serial_index] = '\0'; 
+        if (inChar == '\n' || strstr(g_serial_buffer, "}")) {
+          if (strstr(g_serial_buffer, "\"rslt\":\"F\"")) {
+            subState = 2; displayUpdateNeeded = true; g_serial_index = 0; break; 
+          }
+          else if (strstr(g_serial_buffer, "\"rslt\":\"NF\"")) {
+            subState = 4; displayUpdateNeeded = true; g_serial_index = 0; break;
+          }
         }
-      } else {
-        // Buffer full, treat as not found
-        subState = 4; // Go to Acknowledge Not Found
-        displayUpdateNeeded = true;
-        break;
+      }
+      else {
+        subState = 4; displayUpdateNeeded = true; break;
       }
     }
   }
-  
-  // --- SUB-STATE 2: Confirmation (User Found) ---
+
   else if (subState == 2) {
-    if (displayUpdateNeeded) {
-      // FIX: Display "User found!" and "Del>ok cancle>up"
-      printScreen(F("User found!"), F("Del>ok cancle>up"));
-      displayUpdateNeeded = false;
-    }
-    
-    // Check for OK (Short Select Release)
+    if (displayUpdateNeeded) { printScreen(F("User found!"), F("Del>ok cancle>up")); displayUpdateNeeded = false; }
     if (selectReading == HIGH && localLastSelectState == LOW) {
-      
-      // 1. Send delete request (Optimized)
       sendSerialJson(F("delete"), scannedUserId, NULL, NULL, NULL, NULL);
-      
-      // 2. Transition to wait for delete reply
-      subState = 3; 
-      displayUpdateNeeded = true; 
-      serialReplyIndex = 0; // Clear buffer for delete reply
-    } 
-    // Check for Up or Down (Press) to Cancel
+      subState = 3; displayUpdateNeeded = true; g_serial_index = 0;
+    }
     else if ((upReading == LOW && localLastUpState == HIGH) || (downReading == LOW && localLastDownState == HIGH)) {
-      subState = 6; // Move to Finalize Cancelled
-      displayUpdateNeeded = true; 
+      subState = 6; displayUpdateNeeded = true;
     }
   }
 
-  // --- SUB-STATE 3: Wait for Serial Delete Reply ---
   else if (subState == 3) {
-    if (displayUpdateNeeded) {
-      // FIX: Display "Deleting user" and "Processing...."
-      printScreen(F("Deleting user"), F("Processing...."));
-      displayUpdateNeeded = false;
-    }
-    
-    // Non-blocking serial read and simplified search
+    if (displayUpdateNeeded) { printScreen(F("Deleting user"), F("Processing....")); displayUpdateNeeded = false; }
     while (Serial.available()) {
       char inChar = Serial.read();
-      if (serialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-        serialReplyBuffer[serialReplyIndex++] = inChar;
-        serialReplyBuffer[serialReplyIndex] = '\0'; 
-        
-        // Check for success result: {"md":"delete", "rslt":"DL"}
-        if (strstr(serialReplyBuffer, "\"rslt\":\"DL\"")) {
-          subState = 5; // Success -> Go to Acknowledge Deleted
-          displayUpdateNeeded = true;
-          serialReplyIndex = 0;
-          break; 
-        } 
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+        g_serial_buffer[g_serial_index++] = inChar;
+        g_serial_buffer[g_serial_index] = '\0'; 
+        if (inChar == '\n' || strstr(g_serial_buffer, "}")) {
+          if (strstr(g_serial_buffer, "\"rslt\":\"DL\"")) {
+            subState = 5; displayUpdateNeeded = true; g_serial_index = 0; break; 
+          } 
+        }
       }
     }
   }
 
-  // --- SUB-STATE 4: Acknowledge Not Found (Wait for OK) ---
   else if (subState == 4) {
-    if (displayUpdateNeeded) {
-      // FIX: Display "User not found" and "press ok to exit"
-      printScreen(F("User not found"), F("Press ok to exit"));
-      displayUpdateNeeded = false;
-    }
-
-    // Check for OK (Short Select Release)
+    if (displayUpdateNeeded) { printScreen(F("User not found"), F("Press ok to exit")); displayUpdateNeeded = false; }
     if (selectReading == HIGH && localLastSelectState == LOW) {
-        
-        // Reset all states and return to Main Menu
-        subState = 0; 
-        menuState = 0; 
-        displayMenu();
-        displayUpdateNeeded = true; 
+      subState = 0; menuState = 0; displayMenu(); displayUpdateNeeded = true; 
     }
   }
 
-  // --- SUB-STATE 5: Acknowledge Deleted (Wait for OK) ---
   else if (subState == 5) {
-    if (displayUpdateNeeded) {
-      // FIX: Display "User Deleted" and "Press ok to exit"
-      printScreen(F("User Deleted"), F("Press ok to exit"));
-      displayUpdateNeeded = false;
-    }
-
-    // Check for OK (Short Select Release)
-    if (selectReading == HIGH && localLastSelectState == LOW) {
-        
-        // Reset all states and return to Main Menu
-        subState = 0; 
-        menuState = 0; 
-        displayMenu();
-        displayUpdateNeeded = true; 
-    }
+    if (displayUpdateNeeded) { printScreen(F("User Deleted"), F("Press ok to exit")); displayUpdateNeeded = false; }
+      if (selectReading == HIGH && localLastSelectState == LOW) {
+        subState = 0; menuState = 0; displayMenu(); displayUpdateNeeded = true; 
+      }
   }
 
-  // --- SUB-STATE 6: Finalize Cancelled and Return ---
   else if (subState == 6) {
-    
     if (displayUpdateNeeded) {
       printScreen(F("Canceling..."), F("Returning..."));
-      
-      // TEMPORARY BLOCKING DELAY (500ms): Ensures the message is seen
-      delay(500); 
-      
-      // Reset all states and return to Main Menu
-      subState = 0; 
-      menuState = 0; 
-      displayMenu();
-      displayUpdateNeeded = true; 
+      delay(500);
+      subState = 0; menuState = 0; displayMenu(); displayUpdateNeeded = true;
     }
   }
 
-  // --- UPDATE LOCAL BUTTON STATES ---
   localLastUpState = upReading;
   localLastDownState = downReading;
   localLastSelectState = selectReading;
 }
 
 void settings() {
-  // Static variables for state management and data storage
-  // subState definitions: 
-  // 0: Select Setting Option
-  // 11: Enter Reset Time (Group editing: H/M/S)
-  // 12: Confirm Reset Time
-  // 13: Wait for Reset Time Reply
-  // 14: Acknowledge Update (Wait for OK)
-  // 21: Check Connection (Wait for Reply)
-  // 22: Acknowledge Connection (Wait for OK)
   static int subState = 0; 
   static int settingsSelection = 0; 
-  
-  // Time entry variables
   static int hours = 0;
   static int minutes = 0;
   static int seconds = 0;
-  static int timeGroupIndex = 0; // 0=Hours, 1=Minutes, 2=Seconds
+  static int timeGroupIndex = 0;
   static bool displayUpdateNeeded = true;
-  static char serialReplyBuffer[MAX_REPLY_BUFFER_SIZE]; 
-  static int serialReplyIndex = 0; 	
-
-  // Local state tracking for button releases within this function
   static bool inputReady = false; 
   static int localLastUpState = HIGH;
   static int localLastDownState = HIGH;
   static int localLastSelectState = HIGH;
+  
+  // WiFi Specific Statics
+  static char nets[3][17]; // Reduced to 3 networks, 16 char max SSID + NULL (51 bytes)
+  static int netsCount = 0;
+  static int selectedNet = 0;
+  static unsigned long scanStart = 0;
+  
+  // Static state variables for manual entry flow
+  static char manualSSID[33];
+  static char passwordBuff[33];
+  
+  static unsigned long lastCharUpdateTime = 0;
+  const unsigned long CHAR_SCROLL_DELAY = 150;
+
   int upReading = digitalRead(UP_PIN);
   int downReading = digitalRead(DOWN_PIN);
   int selectReading = digitalRead(SELECT_PIN);
+
+  /* Settings Session Flag
+   * Tracks if settings was entered via the long press (Auth path). This flag should persist
+   * throughout the settings menu session (menuState 3).
+   * static bool enteredDirectlyThisSession = false;
+  **/
   
-  // --- State Check (Used only for cleanup after global long-press exit) ---
+  // Check if the global request flag is set on entry to the Settings parent state (subState 0)
+  if (menuState == 3 && requestDirectWifiEntry && subState == 0) {
+    enteredDirectlyThisSession = true;
+    requestDirectWifiEntry = false;
+  }
+
   if (menuState != 3) { 
-    subState = 0; 
-    settingsSelection = 0; 
-    hours = 0; minutes = 0; seconds = 0;
-    timeGroupIndex = 0;
-    
-    displayUpdateNeeded = true; 
-    inputReady = false;
-    localLastUpState = HIGH;
-    localLastDownState = HIGH;
-    localLastSelectState = HIGH;
-    memset(serialReplyBuffer, 0, sizeof(serialReplyBuffer));
-    serialReplyIndex = 0;
+    // Reset settings state when exiting the menu entirely
+    subState = 0; settingsSelection = 0; hours = minutes = seconds = 0;
+    timeGroupIndex = 0; displayUpdateNeeded = true; inputReady = false;
+    localLastUpState = HIGH; localLastDownState = HIGH; localLastSelectState = HIGH;
+    g_serial_index = 0; g_serial_buffer[0] = '\0'; 
+    // Reset session flag when leaving menuState 3
+    enteredDirectlyThisSession = false;
     return; 
   }
   
-  // --- SUB-STATE 0: Select Setting Option ---
+  // FULL RESET of WiFi buffers whenever entering WiFi settings
+  static bool wifiInit = true;
+
+  if (menuState == 3 && wifiInit && subState == 0) {
+    // Clear previously-entered WiFi SSID & Password & Buffers
+    memset(wifiChosenSSID, 0, sizeof(wifiChosenSSID));
+    memset(wifiChosenPass, 0, sizeof(wifiChosenPass));
+    memset(manualSSID, 0, sizeof(manualSSID));
+    memset(passwordBuff, 0, sizeof(passwordBuff));
+
+    wifiInit = false;
+  }
+
+  // When leaving WiFi settings and returning again → reset flag
   if (subState == 0) {
-    
-    // 1. Navigation
-    if (upReading == LOW && localLastUpState == HIGH) {
-        settingsSelection = (settingsSelection == 0) ? (SETTINGS_MENU_SIZE - 1) : (settingsSelection - 1);
-        displayUpdateNeeded = true;
-    } else if (downReading == LOW && localLastDownState == HIGH) {
-        settingsSelection = (settingsSelection + 1) % SETTINGS_MENU_SIZE;
-        displayUpdateNeeded = true;
+    wifiInit = true;
+  }
+
+
+  if (subState == 0) {
+    if (enteredDirectlyThisSession) {
+      settingsSelection = 1;
+      subState = 30;    
+      displayUpdateNeeded = true;
+      inputReady = false;
+      localLastUpState = HIGH;
+      localLastDownState = HIGH;
+      localLastSelectState = HIGH;
+      return;
     }
-    
-    // 2. Selection
-    if (selectReading == HIGH && localLastSelectState == LOW) {
-        // Clear LCD immediately for clean transition
-        lcd.clear();
         
-        // Manual button state reset to swallow the residual release in the next state
+    // Display logic runs only if we are still in subState 0
+    if (upReading == LOW && localLastUpState == HIGH) { settingsSelection = (settingsSelection == 0) ? (SETTINGS_MENU_SIZE - 1) : (settingsSelection - 1); displayUpdateNeeded = true; }
+    else if (downReading == LOW && localLastDownState == HIGH) { settingsSelection = (settingsSelection + 1) % SETTINGS_MENU_SIZE; displayUpdateNeeded = true; }
+
+    if (selectReading == HIGH && localLastSelectState == LOW) {
+      lcd.clear();
+      localLastUpState = HIGH; localLastDownState = HIGH; localLastSelectState = HIGH;
+      switch(settingsSelection) {
+        case 0: subState = 11; hours = 0; minutes = 0; seconds = 0; timeGroupIndex = 0; displayUpdateNeeded = true; inputReady = false; break;
+        case 1: 
+          subState = 30; 
+          displayUpdateNeeded = true; 
+          inputReady = false; 
+          break;
+      }
+      return;
+    }
+
+    if (displayUpdateNeeded) {
+      char line1[17];
+      char line2[17];
+      char selectedTextRam[17];
+      char nextTextRam[17];
+      
+      // 1. Get and format selected item (Line 1: > ItemName)
+      const char *selectedItemAddr = (const char *)pgm_read_word(&settingsMenuItems[settingsSelection]);
+      strcpy_P(selectedTextRam, selectedItemAddr);
+      
+      // 2. Get and format next item (Line 2: ItemName)
+      int nextItemIndex = (settingsSelection + 1) % SETTINGS_MENU_SIZE;
+      const char *nextItemAddr = (const char *)pgm_read_word(&settingsMenuItems[nextItemIndex]);
+      strcpy_P(nextTextRam, nextItemAddr);
+      
+      // Align text to column 1
+      // Selected line: Starts with '>', text starts column 1
+      snprintf(line1, sizeof(line1), ">%s", selectedTextRam);
+      line1[16] = '\0';
+      
+      // Next line: Starts with ' ', text starts column 1
+      snprintf(line2, sizeof(line2), " %s", nextTextRam); 
+      line2[16] = '\0';
+      
+      printScreen(line1, line2);
+      displayUpdateNeeded = false;
+    }
+  }
+  // NEW SUBSTATE: WAIT FOR BUTTON RELEASE
+  else if (subState == 30) {
+    if (displayUpdateNeeded) {
+      printScreen(F("Ready..."), F("Release SELECT"));
+      displayUpdateNeeded = false;
+    }
+    // Check if the SELECT button is released
+    if (selectReading == HIGH) {
+      localLastSelectState = HIGH;
+      subState = 31; // Go to WiFi scan
+      displayUpdateNeeded = true;
+    }
+  }
+  
+  // Reset time flow (11-14)
+  else if (subState == 11) {
+
+    // time setting logic
+    if (!inputReady) { inputReady = true; } 
+    else {
+      if ((upReading == LOW && localLastUpState == HIGH) || (downReading == LOW && localLastDownState == HIGH)) {
+        int* targetValue = NULL; int minVal = 0, maxVal = 0;
+        if (timeGroupIndex == 0) { targetValue = &hours; maxVal = 23; }
+        else if (timeGroupIndex == 1) { targetValue = &minutes; maxVal = 59; }
+        else if (timeGroupIndex == 2) { targetValue = &seconds; maxVal = 59; }
+        if (targetValue) {
+          if (upReading == LOW && localLastUpState == HIGH) *targetValue = (*targetValue == maxVal) ? minVal : *targetValue + 1;
+          else if (downReading == LOW && localLastDownState == HIGH) *targetValue = (*targetValue == minVal) ? maxVal : *targetValue - 1;
+        }
+        displayUpdateNeeded = true;
+      }
+      if (selectReading == HIGH && localLastSelectState == LOW) {
+        timeGroupIndex++;
+        displayUpdateNeeded = true;
+        if (timeGroupIndex > 2) { subState = 12; displayUpdateNeeded = true; }
+      }
+    }
+    if (displayUpdateNeeded) {
+      char line2[17];
+      snprintf(line2, sizeof(line2), "%s%02d:%s%02d:%s%02d", (timeGroupIndex==0)?">":" ", hours, (timeGroupIndex==1)?">":" ", minutes, (timeGroupIndex==2)?">":" ", seconds);
+      printScreen(F("Set Reset Time"), line2); displayUpdateNeeded = false;
+    }
+  }
+
+  else if (subState == 12) {
+    if (displayUpdateNeeded) {
+      char line1[17]; snprintf(line1, sizeof(line1), "Confirm: %02d:%02d:%02d", hours, minutes, seconds);
+      printScreen(line1, F("OK=Yes Up/Dn=No")); displayUpdateNeeded = false;
+    }
+    if (selectReading == HIGH && localLastSelectState == LOW) { subState = 13; displayUpdateNeeded = true; inputReady = false; }
+    else if ((upReading == LOW && localLastUpState == HIGH) || (downReading == LOW && localLastDownState == HIGH)) { subState = 0; displayUpdateNeeded = true; }
+  }
+
+  else if (subState == 13) {
+    if (displayUpdateNeeded) {
+      char timeString[9]; snprintf(timeString, sizeof(timeString), "%02d:%02d:%02d", hours, minutes, seconds);
+      sendSerialJson(F("rst_time"), NULL, NULL, NULL, NULL, timeString);
+      printScreen(F("Reset Time"), F("Updating...."));
+      displayUpdateNeeded = false;
+      g_serial_index = 0; // Use global index
+    }
+    while (Serial.available()) {
+      char inChar = Serial.read();
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) { // Use global buffer
+        g_serial_buffer[g_serial_index++] = inChar;
+        g_serial_buffer[g_serial_index] = '\0'; 
+        if (inChar == '\n' || strstr(g_serial_buffer, "}")) {
+          if (strstr(g_serial_buffer, "\"rslt\":\"D\"")) { subState = 14; displayUpdateNeeded = true; g_serial_index = 0; inputReady = false; break; }
+        }
+      }
+    }
+  }
+
+  else if (subState == 14) {
+    if (displayUpdateNeeded) { printScreen(F("Settings Updated"), F("Press ok to exit")); displayUpdateNeeded = false; }
+    if (selectReading == HIGH && localLastSelectState == LOW) { subState = 0; menuState = 0; displayMenu(); displayUpdateNeeded = true; }
+  }
+
+  // WiFi flow (31-33)
+  else if (subState == 31) {
+    // 1. Initialization and Scanning
+    if (displayUpdateNeeded && netsCount == 0) {
+      g_serial_index = 0; 
+      g_serial_buffer[0] = '\0';
+      for (int i = 0; i < 3; i++) nets[i][0] = '\0'; 
+      netsCount = 0; 
+      selectedNet = 0;
+      scanStart = millis();
+      sendSerialJson(F("scan_wifi"), NULL, NULL, NULL, NULL, NULL);
+      printScreen(F("Scanning WiFi"), F("Please wait..."));
+      displayUpdateNeeded = false; 
+    }
+
+    // 2. Handle Incoming Serial Data
+    while (Serial.available()) {
+      char inChar = Serial.read();
+      if (g_serial_index < (int)sizeof(g_serial_buffer) - 1) {
+        g_serial_buffer[g_serial_index++] = inChar;
+        g_serial_buffer[g_serial_index] = '\0';
+      }
+      if (inChar == '}') {
+        if (extractValue(g_serial_buffer, "nets", g_temp_extract_buffer, MAX_EXTRACT_BUFFER)) {
+          char *p = g_temp_extract_buffer; 
+          int idx = 0; char tmp[17]; int tpos = 0;
+          while (*p && idx < 3) {
+            if (*p == ';') { 
+              tmp[tpos] = '\0'; 
+              strncpy(nets[idx], tmp, 16); 
+              nets[idx][16] = '\0'; 
+              idx++; tpos = 0; 
+            }
+            else { if (tpos < 16) tmp[tpos++] = *p; }
+            p++;
+          }
+          if (tpos > 0 && idx < 3) { 
+            tmp[tpos] = '\0'; 
+            strncpy(nets[idx], tmp, 16); 
+            nets[idx][16] = '\0'; 
+            idx++; 
+          }
+          netsCount = idx;
+          displayUpdateNeeded = true; 
+        }
+        g_serial_index = 0; 
+        break;
+      }
+    }
+
+    if (netsCount == 0 && (millis() - scanStart > SERIAL_TIMEOUT)) {
+      subState = 34; // Manual entry
+      displayUpdateNeeded = true;
+      return;
+    }
+
+    // 3. Navigation Logic
+    if (netsCount > 0) {
+      if (upReading == LOW && localLastUpState == HIGH) {
+        selectedNet = (selectedNet == 0) ? (netsCount - 1) : (selectedNet - 1);
+        displayUpdateNeeded = true;
+      }
+      else if (downReading == LOW && localLastDownState == HIGH) {
+        selectedNet = (selectedNet + 1) % netsCount;
+        displayUpdateNeeded = true;
+      }
+
+      if (selectReading == HIGH && localLastSelectState == LOW) {
+        strncpy(wifiChosenSSID, nets[selectedNet], sizeof(wifiChosenSSID) - 1);
+        wifiChosenSSID[sizeof(wifiChosenSSID) - 1] = '\0';
+        
+        subState = 32;                  // Move to Password Entry
+        displayUpdateNeeded = true; 
+        inputReady = false;             // Reset flag to force wait-for-release in next state
+        
+        // Reset state trackers so state 32
+        localLastSelectState = HIGH; 
+        selectReading = HIGH;
+        return;
+      }
+
+      if (displayUpdateNeeded) {
+        char line1[17], line2[17];
+        int next = (selectedNet + 1) % netsCount;
+        snprintf(line1, sizeof(line1), ">%s", nets[selectedNet]);
+        snprintf(line2, sizeof(line2), " %s", nets[next]);
+        printScreen(line1, line2);
+        displayUpdateNeeded = false;
+      }
+    }
+  }
+
+  else if (subState == 32) {
+    // password char-scroll
+    static bool pwdInit = true;
+    static int charIndex = 0;
+    static char currentLetter;
+    static int pwdPos = 0;
+
+    // 1. RELEASE GUARD: Wait for button release from SSID selection
+    if (!inputReady) {
+      if (selectReading == HIGH) {  // Button lifted
+        inputReady = true;       
+        pwdInit = true;             // Force a clean start
+      }
+      return;
+    }
+
+    // 2. INITIALIZATION
+    if (pwdInit) { 
+      charIndex = 0; 
+      currentLetter = CHAR_TABLE[charIndex]; 
+      pwdPos = 0; 
+      memset(passwordBuff, 0, sizeof(passwordBuff)); 
+      displayUpdateNeeded = true; 
+      pwdInit = false;
+
+      // Final guard: ensures we don't process a press on the exact frame we initialize
+      localLastSelectState = HIGH;
+    }
+
+    // 3. SCROLLING LOGIC
+    if (millis() - lastCharUpdateTime > CHAR_SCROLL_DELAY) {
+      bool scrolled = false;
+      if (upReading == LOW) { 
+        charIndex--; if (charIndex < 0) charIndex = CHAR_TABLE_SIZE - 1; 
+        scrolled = true; 
+      }
+      else if (downReading == LOW) { 
+        charIndex++; if (charIndex >= CHAR_TABLE_SIZE) charIndex = 0; 
+        scrolled = true; 
+      }
+      if (scrolled) {
+        currentLetter = CHAR_TABLE[charIndex];
+        lastCharUpdateTime = millis();
+        displayUpdateNeeded = true;
+      }
+    }
+
+    // 4. SELECTION LOGIC
+    if (selectReading == HIGH && localLastSelectState == LOW) {
+      if (currentLetter == '*') {
+        // Save and move to connection
+        strncpy(wifiChosenPass, passwordBuff, sizeof(wifiChosenPass) - 1);
+        wifiChosenPass[sizeof(wifiChosenPass) - 1] = '\0';
+        
+        subState = 33; // CONNECTING
+        displayUpdateNeeded = true;
+        pwdInit = true; // Reset for next time
+        return; 
+      }
+
+      // Add character to password
+      if (pwdPos < (int)sizeof(passwordBuff) - 1) { 
+        passwordBuff[pwdPos++] = currentLetter; 
+        passwordBuff[pwdPos] = '\0'; 
+        charIndex = 0; // Reset scroll to start of table
+        currentLetter = CHAR_TABLE[charIndex];
+        displayUpdateNeeded = true;
+      }
+    }
+
+    // 5. RENDER DISPLAY
+    if (displayUpdateNeeded) {
+      char line1[17], line2[17];
+      snprintf(line1, sizeof(line1), "PW: %s", passwordBuff);
+      line1[16] = '\0';
+      snprintf(line2, sizeof(line2), "P:%d Chr:<%c>", pwdPos + 1, currentLetter);
+      line2[16] = '\0';
+      
+      printScreen(line1, line2);
+      displayUpdateNeeded = false;
+    }
+  }
+
+  else if (subState == 33) {
+    // Connection attempt
+    static unsigned long wifiTxTime = 0;
+
+    if (displayUpdateNeeded) {
+      sendWifiJson(wifiChosenSSID, wifiChosenPass);
+      printScreen(F("WiFi"), F("Connecting..."));
+      g_serial_index = 0; g_serial_buffer[0] = '\0';
+      wifiTxTime = millis();
+      displayUpdateNeeded = false;
+    }
+
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (g_serial_index < MAX_GLOBAL_BUFFER_SIZE - 1) {
+        g_serial_buffer[g_serial_index++] = c;
+        g_serial_buffer[g_serial_index] = '\0';
+      }
+      if (c == '}') {
+        if (strstr(g_serial_buffer, "\"md\":\"wifi\"") && strstr(g_serial_buffer, "\"rslt\":\"C\"")) {
+          printScreen(F("wifi connected"), F("Press ok to exit"));
+          subState = 36; return;
+        } else {
+          printScreen(F("error connecting"), F("Press ok to exit"));
+          subState = 36; return;
+        }
+      }
+    }
+    if (millis() - wifiTxTime > SERIAL_TIMEOUT) {
+      printScreen(F("error connecting"), F("Press ok to exit"));
+      subState = 36; displayUpdateNeeded = true; return;
+    }
+  }
+
+  else if (subState == 34) {
+    // manual SSID entry
+    static bool ssidInit = true;
+    static int charIndex = 0;
+    static char currentLetter = CHAR_TABLE[0];
+    static int ssidPos = 0;
+    static int okCountSS = 0; // Use okPressCount logic
+
+    if (ssidInit) { 
+      memset(manualSSID, 0, sizeof(manualSSID)); 
+      memset(wifiChosenSSID, 0, sizeof(wifiChosenSSID)); 
+      charIndex=0; 
+      currentLetter=CHAR_TABLE[charIndex]; 
+      ssidPos=0; 
+      displayUpdateNeeded=true; 
+      ssidInit=false; 
+      okCountSS = 0;
+      }
+
+    // Add continuous scrolling
+    if (millis() - lastCharUpdateTime > CHAR_SCROLL_DELAY) {
+      bool scrolled = false;
+      if (upReading == LOW) { 
+        charIndex--; if (charIndex<0) charIndex=CHAR_TABLE_SIZE-1; currentLetter=CHAR_TABLE[charIndex]; scrolled=true; 
+      }
+      else if (downReading == LOW) { 
+        charIndex++; if (charIndex>=CHAR_TABLE_SIZE) charIndex=0; currentLetter=CHAR_TABLE[charIndex]; scrolled=true; 
+      }
+      if (scrolled) {
+        lastCharUpdateTime = millis();
+        okCountSS = 0; 
+        displayUpdateNeeded = true;
+      }
+    }
+
+
+    if (selectReading == HIGH && localLastSelectState == LOW) {
+      if (currentLetter == '*') {
+        // Confirm entry: Move to password screen (subState 35)
+        strncpy(wifiChosenSSID, manualSSID, sizeof(wifiChosenSSID)-1); wifiChosenSSID[sizeof(wifiChosenSSID)-1]='\0';
+        localLastUpState = HIGH;
+        localLastDownState = HIGH;
+        localLastSelectState = HIGH;
+        subState = 35; // Go to password input
+        displayUpdateNeeded = true; 
+        return;
+      }
+      
+      if (okCountSS == 1) {
+        strncpy(wifiChosenSSID, manualSSID, sizeof(wifiChosenSSID)-1); wifiChosenSSID[sizeof(wifiChosenSSID)-1]='\0';
+        
+        // Reset button states before state transition
+        localLastUpState = HIGH;
+        localLastDownState = HIGH;
+        localLastSelectState = HIGH;
+        subState = 35; // Go to password input
+        displayUpdateNeeded = true; 
+        return;
+      }
+
+      if (ssidPos < (int)sizeof(wifiChosenSSID) - 1) { 
+        manualSSID[ssidPos++] = currentLetter; manualSSID[ssidPos] = '\0'; 
+      }
+      
+      charIndex = 0; currentLetter = CHAR_TABLE[charIndex]; 
+      okCountSS = 1;
+      displayUpdateNeeded = true;
+    }
+
+    if (displayUpdateNeeded) {
+      char line1[17], line2[17];
+      snprintf(line1, sizeof(line1), "SSID: %s", manualSSID);
+      snprintf(line2, sizeof(line2), "%c Char %d: <%c>",
+      okCountSS == 0 ? '>' : '!', // Use > if choosing char, ! if confirming/ready to exit
+      ssidPos + 1,
+      currentLetter);
+      line2[16]='\0';
+      printScreen(line1, line2);
+      displayUpdateNeeded=false;
+    }
+  }
+
+  else if (subState == 35) {
+    // manual password entry
+    static bool pwdInit = true;
+    static int charIndex = 0;
+    static char currentLetter = CHAR_TABLE[0];
+    static int pwdPos = 0;
+    static int okCount = 0;
+
+    if (pwdInit) { 
+      memset(passwordBuff, 0, sizeof(passwordBuff)); 
+      memset(wifiChosenPass, 0, sizeof(wifiChosenPass)); 
+      charIndex=0; 
+      currentLetter=CHAR_TABLE[charIndex]; 
+      pwdPos=0; 
+      displayUpdateNeeded=true; 
+      pwdInit=false; 
+      okCount = 0;
+    }
+
+    // Character scrolling and selection logic
+    if (millis() - lastCharUpdateTime > CHAR_SCROLL_DELAY) {
+      bool scrolled = false;
+      if (upReading == LOW) { 
+        charIndex--; if (charIndex<0) charIndex=CHAR_TABLE_SIZE-1; currentLetter=CHAR_TABLE[charIndex]; scrolled=true; 
+      }
+      else if (downReading == LOW) { 
+        charIndex++; if (charIndex>=CHAR_TABLE_SIZE) charIndex=0; currentLetter=CHAR_TABLE[charIndex]; scrolled=true; 
+      }
+      if (scrolled) {
+        lastCharUpdateTime = millis();
+        okCount = 0; 
+        displayUpdateNeeded = true;
+      }
+    }
+
+    if (selectReading == HIGH && localLastSelectState == LOW) {
+      if (currentLetter == '*') {
+        // Password entry complete: Move to connection attempt (subState 33)
+        strncpy(wifiChosenPass, passwordBuff, sizeof(wifiChosenPass)-1); wifiChosenPass[sizeof(wifiChosenPass)-1]='\0';
+        
+        // Reset button states before state transition
         localLastUpState = HIGH;
         localLastDownState = HIGH;
         localLastSelectState = HIGH;
 
-        switch(settingsSelection) {
-            case 0: // Set Timer selected
-                subState = 11; 
-                hours = 0; minutes = 0; seconds = 0;
-                timeGroupIndex = 0;
-                displayUpdateNeeded = true;
-                inputReady = false; // CRITICAL: Skip input on first cycle
-                break;
-            case 1: // Check Connection selected
-                subState = 21; 
-                displayUpdateNeeded = true;
-                inputReady = false; // CRITICAL: Skip input on first cycle
-                break;
-            default:
-                break;
-        }
-        return; 
-    }
-
-    // 3. Display (Scrolling Menu)
-    if (displayUpdateNeeded) {
-        char line1[17];
-        char line2[17];
-        
-        // Line 0: Selected item
-        // Format: > 1. Set Timer (Padded with spaces)
-        snprintf(line1, sizeof(line1), "> %s               ", settingsMenuItems[settingsSelection]);
-        line1[16] = '\0'; // Truncate to 16 characters
-
-        // Line 1: Next item (scrolling effect)
-        // Format:   2. Check Conn (Padded with spaces)
-        int nextItemIndex = (settingsSelection + 1) % SETTINGS_MENU_SIZE;
-        snprintf(line2, sizeof(line2), "  %s               ", settingsMenuItems[nextItemIndex]);
-        line2[16] = '\0'; // Truncate to 16 characters
-        
-        lcd.setCursor(0, 0);
-        lcd.print(line1);
-
-        lcd.setCursor(0, 1);
-        lcd.print(line2);
-        
-        displayUpdateNeeded = false;
-    }
-  }
-  
-  // ----------------------------------------------------
-  // --- RESET TIME LOGIC (SUB-STATES 11-14) ---
-  // ----------------------------------------------------
-
-  // --- SUB-STATE 11: Enter Reset Time (Group Editing) ---
-  else if (subState == 11) {
-    
-    // Input Guard: Skip the first cycle to swallow residual OK press
-    if (!inputReady) {
-        inputReady = true;
-        // Proceed to display
-    } else {
-        // --- Input Handling: Up/Down to Scroll Group Value ---
-        if ((upReading == LOW && localLastUpState == HIGH) || (downReading == LOW && localLastDownState == HIGH)) {
-          int* targetValue = nullptr;
-          int minVal = 0;
-          int maxVal = 0;
-
-          if (timeGroupIndex == 0) { // Hours
-            targetValue = &hours;
-            maxVal = 23;
-          } else if (timeGroupIndex == 1) { // Minutes
-            targetValue = &minutes;
-            maxVal = 59;
-          } else if (timeGroupIndex == 2) { // Seconds
-            targetValue = &seconds;
-            maxVal = 59;
-          }
-
-          if (targetValue != nullptr) {
-            if (upReading == LOW && localLastUpState == HIGH) {
-              *targetValue = (*targetValue == maxVal) ? minVal : *targetValue + 1;
-            } else if (downReading == LOW && localLastDownState == HIGH) {
-              *targetValue = (*targetValue == minVal) ? maxVal : *targetValue - 1;
-            }
-          }
-          displayUpdateNeeded = true;
-        }
-        
-        // --- Input Handling: Select (OK) to Lock Group ---
-        if (selectReading == HIGH && localLastSelectState == LOW) {
-          timeGroupIndex++;
-          displayUpdateNeeded = true;
-
-          if (timeGroupIndex > 2) {
-            // All groups entered, move to confirmation
-            subState = 12;
-            displayUpdateNeeded = true;
-          }
-        }
-    }
-
-    // --- Conditional Display ---
-    if (displayUpdateNeeded) {
-      char line2[17];
-      
-      // Format time string: HH:MM:SS (with selector indicator)
-      snprintf(line2, sizeof(line2), "%s%02d:%s%02d:%s%02d", 
-               (timeGroupIndex == 0) ? ">" : " ", hours,
-               (timeGroupIndex == 1) ? ">" : " ", minutes,
-               (timeGroupIndex == 2) ? ">" : " ", seconds);
-      
-      printScreen(F("Set Reset Time"), line2); 
-      
-      displayUpdateNeeded = false;
-    }
-  }
-
-  // --- SUB-STATE 12: Confirm Reset Time ---
-  else if (subState == 12) {
-    if (displayUpdateNeeded) {
-        char line1[17];
-        snprintf(line1, sizeof(line1), "Confirm: %02d:%02d:%02d", hours, minutes, seconds);
-        // FIX: Use RAM, Flash overload
-        printScreen(line1, F("OK=Yes Up/Dn=No"));
-        displayUpdateNeeded = false;
-    }
-
-    // Check for OK (Short Select Release) -> YES
-    if (selectReading == HIGH && localLastSelectState == LOW) {
-        subState = 13; // Move to Wait for Reply
-        displayUpdateNeeded = true;
-        inputReady = false; // Reset for next state
-    }
-    // Check for Up or Down (Press) to Cancel -> NO
-    else if ((upReading == LOW && localLastUpState == HIGH) || (downReading == LOW && localLastDownState == HIGH)) {
-        subState = 0; // Return to settings menu selection
-        displayUpdateNeeded = true;
-    }
-  }
-
-  // --- SUB-STATE 13: Wait for Reset Time Reply ---
-  else if (subState == 13) {
-    if (displayUpdateNeeded) {
-      char timeString[9];
-      snprintf(timeString, sizeof(timeString), "%02d:%02d:%02d", hours, minutes, seconds);
-               
-      // 1. Print Final JSON to Serial Monitor (Optimized)
-      sendSerialJson(F("rst_time"), NULL, NULL, NULL, NULL, timeString);
-      
-      // 2. Display waiting message (FIX: Reset Time / Updating....)
-      printScreen(F("Reset Time"), F("Updating...."));
-      displayUpdateNeeded = false;
-      serialReplyIndex = 0; // Clear buffer
-    }
-    
-    // Non-blocking serial read and check for reply
-    while (Serial.available()) {
-      char inChar = Serial.read();
-      if (serialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-        serialReplyBuffer[serialReplyIndex++] = inChar;
-        serialReplyBuffer[serialReplyIndex] = '\0'; 
-        
-        // Check for success result: {"md":"rst_time", "rslt":"D"}
-        if (strstr(serialReplyBuffer, "\"rslt\":\"D\"")) {
-          subState = 14; // Success -> Go to Acknowledge Update
-          displayUpdateNeeded = true;
-          serialReplyIndex = 0;
-          inputReady = false; // Reset for next state
-          break; 
-        } 
+        subState = 33; displayUpdateNeeded=true; return; 
       }
+
+      // If pressing 'OK' on a character
+      if (okCount == 1) {
+        strncpy(wifiChosenPass, passwordBuff, sizeof(wifiChosenPass)-1); wifiChosenPass[sizeof(wifiChosenPass)-1]='\0';
+        // Reset button states before state transition
+        localLastUpState = HIGH;
+        localLastDownState = HIGH;
+        localLastSelectState = HIGH;
+        subState = 33; displayUpdateNeeded=true; return;
+      }
+
+      if (pwdPos < (int)sizeof(wifiChosenPass) - 1) { passwordBuff[pwdPos++] = currentLetter; passwordBuff[pwdPos] = '\0'; }
+      charIndex = 0; currentLetter = CHAR_TABLE[charIndex]; 
+      okCount = 1;
+      displayUpdateNeeded = true;
+    }
+
+    if (displayUpdateNeeded) {
+      char line1[17], line2[17];
+      snprintf(line1, sizeof(line1), "Pass: %s", passwordBuff);
+      line1[16]='\0';
+      snprintf(line2, sizeof(line2), "%c Char %d: <%c>", 
+        okCount == 0 ? '>' : '!', // Use > if choosing char, ! if confirming/ready to exit
+        pwdPos + 1, currentLetter);
+      line2[16]='\0';
+      printScreen(line1, line2); displayUpdateNeeded=false;
     }
   }
 
-  // --- SUB-STATE 14: Acknowledge Update (Wait for OK) ---
-  else if (subState == 14) {
-    if (displayUpdateNeeded) {
-      // FIX: Settings Updated / Press ok to exit
-      printScreen(F("Settings Updated"), F("Press ok to exit"));
-      displayUpdateNeeded = false;
-    }
-
-    // Check for OK (Short Select Release)
-    if (selectReading == HIGH && localLastSelectState == LOW) {
+  else if (subState == 36) {
+    if (displayUpdateNeeded) { displayUpdateNeeded=false; } 
+      if (selectReading == HIGH && localLastSelectState == LOW) {
+        localLastUpState = HIGH;
+        localLastDownState = HIGH;
+        localLastSelectState = HIGH;
         
-        // Reset all states and return to Main Menu
-        subState = 0; 
-        menuState = 0; 
-        displayMenu();
-        
-        displayUpdateNeeded = true; 
-    }
-  }
-
-  // ----------------------------------------------------
-  // --- CHECK CONNECTION LOGIC (SUB-STATES 21-22) ---
-  // ----------------------------------------------------
-
-  // --- SUB-STATE 21: Wait for Connection Reply ---
-  else if (subState == 21) {
-    if (displayUpdateNeeded) {
-      // 1. Send Check Connection JSON
-      sendSerialJson(F("conn"), NULL, NULL, NULL, NULL, NULL);
-
-      // 2. Display checking message (FIX: Checking Conn. / Processing....)
-      printScreen(F("Checking Conn."), F("Processing...."));
-      displayUpdateNeeded = false;
-      serialReplyIndex = 0; // Clear buffer
-    }
-
-    // Non-blocking serial read
-    while (Serial.available()) {
-      char inChar = Serial.read();
-      if (serialReplyIndex < MAX_REPLY_BUFFER_SIZE - 1) {
-        serialReplyBuffer[serialReplyIndex++] = inChar;
-        serialReplyBuffer[serialReplyIndex] = '\0'; 
-        
-        // Check for success result: {"md":"conn", "rslt":"C"}
-        if (strstr(serialReplyBuffer, "\"rslt\":\"C\"")) {
-          subState = 22; // Success -> Go to Acknowledge
-          displayUpdateNeeded = true;
-          serialReplyIndex = 0;
-          inputReady = false; // Reset for next state
-          break; 
-        } 
-        // Check for failure result: {"md":"conn", "rslt":"NC"}
-        else if (strstr(serialReplyBuffer, "\"rslt\":\"NC\"")) {
-          subState = 22; // Failure -> Go to Acknowledge
-          displayUpdateNeeded = true;
-          serialReplyIndex = 0;
-          inputReady = false; // Reset for next state
-          break;
+        // Check if we entered directly and adjust exit state
+        if (enteredDirectlyThisSession) {
+          enteredDirectlyThisSession = false;
+          subState = 0;
+          menuState = -2; // Go to Scan/Idle state
         }
-      }
+        else {
+          // Normal exit path (back to Settings Menu)
+          subState = 0; 
+          menuState = 3; 
+          settingsSelection = 0; 
+          displayUpdateNeeded = true;
+        }
+        return;
     }
   }
 
-  // --- SUB-STATE 22: Acknowledge Connection (Wait for OK) ---
-  else if (subState == 22) {
-    if (displayUpdateNeeded) {
-      // Check which status we received (by checking the buffer content)
-      bool isConnected = strstr(serialReplyBuffer, "\"rslt\":\"C\"");
-
-      if (isConnected) {
-        // FIX: Connected! / press ok to exit
-        printScreen(F("Connected!"), F("Press ok to exit"));
-      } else {
-        // FIX: Not Connected! / press ok to exit
-        printScreen(F("Not Connected!"), F("Press ok to exit"));
-      }
-      displayUpdateNeeded = false;
-    }
-
-    // Check for OK (Short Select Release)
-    if (selectReading == HIGH && localLastSelectState == LOW) {
-        
-        // Reset all states and return to Main Menu
-        subState = 0; 
-        menuState = 0; 
-        displayMenu();
-        
-        displayUpdateNeeded = true; 
-    }
-  }
-
-
-  // --- UPDATE LOCAL BUTTON STATES ---
   localLastUpState = upReading;
   localLastDownState = downReading;
   localLastSelectState = selectReading;
 }
 
-
-// --- Main Loop (The State Machine) ---
 void loop() {
-  // 1. Check for user input (navigation/selection/return) 
-  if (menuState > -1) { // Only check input if we are in Main Menu or an Action State
-    handleInput();
-  }
-
-  // 2. Handle the current state by calling the corresponding function
+  if (menuState > -1) { handleInput(); }
   switch (menuState) {
     case -3:
     case -2:
-      handleAuthentication();
-      break;
-      
+    handleAuthentication();
+    break;
     case 0:
-      // State 0: Main Menu. Loop just waits for input from handleInput().
-      break;
-
+    // Main menu idle
+    break;
     case 1:
-      // State 1: Option 1 (Add User) - All logic is now self-contained in this function
-      addUser();
-      break;
-
+    addUser();
+    break;
     case 2:
-      // State 2: Option 2 (Delete User)
-      deleteUser();
-      break;
-
+    deleteUser();
+    break;
     case 3:
-      // State 3: Option 3 (Settings)
-      settings();
-      break;
-
+    settings();
+    break;
     default:
-      menuState = -2; // Default to Scan/Idle mode
-      break;
+    menuState = -2;
+    break;
   }
 
+  indicatorUpdate();
+  doorUpdate();
   delay(10);
 }
