@@ -40,7 +40,7 @@ def initialize_files():
         ws.append(['user_id', 'user_name', 'user_title'])
         
         # --- Add Default Admin User ---
-        ws.append(['426E3302', 'master_admin', 'admin'])
+        ws.append(['426E3302', 'master_admin', 'admin']) # --- Add here the default Admin RFID ---
         
         wb.save(USER_DB_FILE)
         print(f"[INIT] Created {USER_DB_FILE} with headers and default admin (426E3302).")
@@ -218,7 +218,7 @@ async def send_reply(websocket, reply_msg):
     """Utility function to format and send a reply back to the ESP client."""
     msg = {"to": TARGET_NAME, "msg": reply_msg}
     await websocket.send(json.dumps(msg))
-    print(f"[REPLY] ⬅️ Sent to {TARGET_NAME}: {reply_msg}")
+    print(f"[REPLY] Sent to {TARGET_NAME}: {reply_msg}")
 
 async def handle_scan_command(websocket, id_value):
     """Handles the SCAN command (Attendance Logic)."""
