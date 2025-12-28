@@ -24,12 +24,12 @@ async def router(websocket, path=None):
             
             # --- Inline Registration Logic ---
             CLIENTS[client_name] = websocket
-            print(f"[SERVER] 🟢 Client '{client_name}' connected. Total clients: {len(CLIENTS)}")
+            print(f"[SERVER] Client '{client_name}' connected. Total clients: {len(CLIENTS)}")
             await websocket.send(json.dumps({"status": "connected", "message": f"Welcome, {client_name}! Registered successfully."}))
             # ---------------------------------
             
         else:
-            print("[SERVER] ⚠️ First message was not a valid registration. Closing connection.")
+            print("[SERVER] First message was not a valid registration. Closing connection.")
             await websocket.close(code=1008, reason="Registration failed")
             return
 
@@ -53,41 +53,41 @@ async def router(websocket, path=None):
                         }
                         
                         await recipient_ws.send(json.dumps(payload_with_sender))
-                        print(f"[SERVER] ➡️ {client_name} → {recipient_name}. Payload: {payload}")
+                        print(f"[SERVER] {client_name} → {recipient_name}. Payload: {payload}")
                     else:
                         error_msg = {"error": f"Recipient '{recipient_name}' not found."}
                         await websocket.send(json.dumps(error_msg))
-                        print(f"[SERVER] ❌ Failed to route from '{client_name}': Recipient '{recipient_name}' not found.")
+                        print(f"[SERVER] Failed to route from '{client_name}': Recipient '{recipient_name}' not found.")
                 else:
                     error_msg = {"error": "Invalid message format. Missing 'to' or 'msg'."}
                     await websocket.send(json.dumps(error_msg))
-                    print(f"[SERVER] ⚠️ Received invalid message from '{client_name}': {message}")
+                    print(f"[SERVER] Received invalid message from '{client_name}': {message}")
 
             except json.JSONDecodeError:
                 error_msg = {"error": "Invalid JSON received."}
                 await websocket.send(json.dumps(error_msg))
-                print(f"[SERVER] ❌ Invalid JSON received from '{client_name}'.")
+                print(f"[SERVER] Invalid JSON received from '{client_name}'.")
             except Exception as e:
-                print(f"[SERVER] ❌ Error handling message from '{client_name}': {e}")
+                print(f"[SERVER] Error handling message from '{client_name}': {e}")
 
     except websockets.exceptions.ConnectionClosedOK:
-        print(f"[SERVER] 🔴 Client '{client_name}' closed connection gracefully.")
+        print(f"[SERVER] Client '{client_name}' closed connection gracefully.")
     except websockets.exceptions.ConnectionClosedError as e:
-        print(f"[SERVER] 🔴 Client '{client_name}' closed connection unexpectedly: {e}")
+        print(f"[SERVER] Client '{client_name}' closed connection unexpectedly: {e}")
     except Exception as e:
         # Catch errors during registration or connection setup
-        print(f"[SERVER] 🚨 FATAL error during connection for {client_name}: {e}")
+        print(f"[SERVER] FATAL error during connection for {client_name}: {e}")
     finally:
         # --- Inline Unregistration Logic ---
         if client_name and client_name in CLIENTS:
             del CLIENTS[client_name]
-            print(f"[SERVER] 🔴 {client_name} disconnected. Total clients: {len(CLIENTS)}")
+            print(f"[SERVER] {client_name} disconnected. Total clients: {len(CLIENTS)}")
         # ---------------------------------
 
 async def main():
     """Sets up and runs the WebSocket server."""
     bind_host = "0.0.0.0"
-    print(f"[SERVER] 🚀 WebSocket server running on ws://{bind_host}:{SERVER_PORT}")
+    print(f"[SERVER] WebSocket server running on ws://{bind_host}:{SERVER_PORT}")
     async with websockets.serve(router, bind_host, SERVER_PORT):
         await asyncio.Future()  # Run forever
 
